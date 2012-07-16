@@ -14,7 +14,7 @@ import Snap.Snaplet.OAuth2
 data App = App { _oAuth :: Snaplet OAuth }
 makeLenses [''App]
 
--- This handler what normally display a login form, and require users to
+-- This handler will normally display a login form, and require users to
 -- login to the website and then grant access to a client. In this example
 -- we'll just assume a sucessful login, and that request was granted.
 doLogin :: AuthorizationRequest -> Handler App OAuth AuthorizationResult
