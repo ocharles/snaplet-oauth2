@@ -1,0 +1,37 @@
+
+* snaplet-oauth2 todo list
+** Spec compliance
+*** (Classify which section these come from)
+**** TODO Mandate request parameters only occurance at most once
+**** TODO Ignore request parameters with no value
+**** TODO Implict grants
+**** TODO [3.1.1] Return an error for unknown response_types
+**** TODO Mandadate redirection URIs are absolute, valid and contains no fragment component
+**** TODO Mandate POST to get tokens
+
+
+*** 4
+**** 4.1
+
+***** 4.1.2. Authorization Response
+****** TODO Authorization code's must expire
+****** TODO If an authorization code is used more than once the request must be denied
+
+****** 4.1.2.1. Error Response
+******* TODO Implement!
+***** 4.1.3. Access Token Request
+****** TODO Ensure that the auth code was given to the correct client
+****** TODO Verify the auth code is valid
+***** 4.1.4. Access Token Response
+**** 4.2. Implicit Grant
+***** TODO Implement
+**** 4.3. Resource Owner Password Credentials Grant
+***** TODO Implement
+
+**** 4.4. Client Credentials Grant
+***** TODO Implement
+
+
+
+*** TODO Unit tests!
+*** TODO Various warnings (failed pattern matches, etc)
