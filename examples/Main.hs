@@ -37,7 +37,7 @@ protected = with oAuth $ protect deny $ do
 appInit :: SnapletInit App App
 appInit = makeSnaplet "oauth-example" "Example OAuth server" Nothing $ do
   addRoutes [ ("/protected", protected) ]
-  App <$> nestSnaplet "" oAuth (oAuthInit doLogin showCode)
+  App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode)
 
 -- And serve it!
 main = serveSnaplet defaultConfig appInit

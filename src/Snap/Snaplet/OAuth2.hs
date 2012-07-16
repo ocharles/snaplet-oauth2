@@ -1,12 +1,15 @@
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE Rank2Types #-}
 module Snap.Snaplet.OAuth2
        ( -- * Snaplet Definition
          OAuth
-       , oAuthInit
+       , initInMemoryOAuth
 
          -- * Authorization Handlers
        , AuthorizationResult(..)
        , AuthorizationRequest
+       , Code
        , authReqClientId, authReqRedirectUri
        , authReqScope, authReqState
 
@@ -17,31 +20,55 @@ module Snap.Snaplet.OAuth2
 import Control.Applicative ((<$>), (<*>), (<*), pure)
 import Control.Error.Util
 import Control.Monad (unless)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Reader
-import Control.Monad.State.Class (gets)
+import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
 import Control.Monad.Trans.Either
 import Data.Aeson (ToJSON(..), encode, (.=), object)
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import qualified Data.Text as Text
 import Data.IORef
 import Data.Text (Text, pack)
 import Data.Text.Encoding (decodeUtf8)
+import Data.Time (UTCTime, addUTCTime, getCurrentTime)
 import Snap.Core
 import Snap.Snaplet
 import Snap.Snaplet.Session.Common
+
+--------------------------------------------------------------------------------
+class OAuthBackend oauth where
+  storeToken               :: MonadIO m => oauth -> AccessToken -> EitherT Text m AccessToken
+  storeAuthorizationGrant  :: MonadIO m => oauth -> AuthorizationGrant -> EitherT Text m ()
+  lookupAuthorizationGrant :: MonadIO m => oauth -> Code -> m (Maybe AuthorizationGrant)
 
 --------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
 type Code = Text
 
 --------------------------------------------------------------------------------
+data InMemoryOAuth = InMemoryOAuth
+  { oAuthGranted :: IORef (Map.Map Code AuthorizationGrant)
+  , oAuthAliveTokens :: IORef (Set.Set AccessToken)
+  }
+
+instance OAuthBackend InMemoryOAuth where
+  storeAuthorizationGrant be grant =
+    liftIO $ modifyIORef (oAuthGranted be) (Map.insert (authGrantCode grant) grant)
+
+  lookupAuthorizationGrant be code =
+    liftIO $ Map.lookup code <$> readIORef (oAuthGranted be)
+
+  storeToken be token = do
+    liftIO $ modifyIORef (oAuthAliveTokens be) (Set.insert token)
+    return token
+
 {-| The OAuth snaplet. You should nest this inside your application snaplet
-using 'nestSnaplet' with the 'oAuthInit' initializer. -}
-data OAuth = OAuth
-  { oAuthGranted :: IORef (Map.Map Code AuthorizationRequest)
+using 'nestSnaplet' with the 'initInMemoryOAuth' initializer. -}
+data OAuth = forall o. OAuthBackend o => OAuth
+  { oAuthBackend :: o
   , oAuthRng :: RNG
   }
 
@@ -79,6 +106,13 @@ request. -}
   }
 
 --------------------------------------------------------------------------------
+data AuthorizationGrant = AuthorizationGrant
+  { authGrantCode :: Code
+  , authGrantExpiresAt :: UTCTime
+  , authGrantRedirectUri :: Maybe BS.ByteString
+  }
+
+--------------------------------------------------------------------------------
 data AccessTokenRequest = AccessTokenRequest
   { accessTokenCode :: Code
   , accessTokenRedirect :: Maybe BS.ByteString
@@ -90,11 +124,11 @@ data AccessToken = AccessToken
   , accessTokenType :: AccessTokenType
   , accessTokenExpiresIn :: Int
   , accessTokenRefreshToken :: Code
-  }
+  } deriving (Eq, Ord)
 
 --------------------------------------------------------------------------------
 data AccessTokenType = Example | Bearer
-  deriving (Show)
+  deriving (Eq, Ord, Show)
 
 --------------------------------------------------------------------------------
 instance ToJSON AccessToken where
@@ -114,23 +148,31 @@ authorizationRequest authHandler genericDisplay =
     case authResult of
       Success -> do
         code <- newCSRFToken
-        gets oAuthGranted >>= \codes -> liftIO $ modifyIORef codes (Map.insert code authReq)
-        case authReqRedirectUri authReq of
-          Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
-          Nothing -> genericDisplay code
-          Just uri -> error "Redirect to a URI is not yet supported"
+        now <- liftIO getCurrentTime
+        let authGrant = AuthorizationGrant { authGrantCode = code
+                                           , authGrantExpiresAt = addUTCTime (60 * 10) now
+                                           , authGrantRedirectUri = authReqRedirectUri authReq
+                                           }
+        withBackend $ \be ->
+          eitherT (error . show) (const $ authReqStored code authReq)
+            (storeAuthorizationGrant be authGrant)
       InProgress -> return ()
+  where authReqStored code authReq =
+          case authReqRedirectUri authReq of
+            Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
+            Nothing -> genericDisplay code
+            Just uri -> error "Redirect to a URI is not yet supported"
 
 requestToken :: Handler b OAuth ()
 requestToken =
   runParamParser getPostParams parseTokenRequestParameters $ \tokenReq -> do
-    req' <- Map.lookup (accessTokenCode tokenReq) <$> (gets oAuthGranted >>= liftIO . readIORef)
-    case req' of
+    grant' <- withBackend $ \be -> lookupAuthorizationGrant be (accessTokenCode tokenReq)
+    case grant' of
       Nothing -> do
         modifyResponse (setResponseCode 400)
         writeText $ Text.append (pack "Authorization request not found: ") (accessTokenCode tokenReq)
-      Just req ->
-        case authReqRedirectUri req == accessTokenRedirect tokenReq of
+      Just grant ->
+        case authGrantRedirectUri grant == accessTokenRedirect tokenReq of
           True -> do
             token <- newCSRFToken
             let grantedAccessToken = AccessToken
@@ -139,7 +181,14 @@ requestToken =
                   , accessTokenExpiresIn = 3600
                   , accessTokenRefreshToken = token
                   }
-            writeLBS $ encode grantedAccessToken
+            withBackend $ \be ->
+              eitherT (error . show) tokenGranted (storeToken be grantedAccessToken)
+  where tokenGranted = writeLBS . encode
+
+withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
+            -> Handler b OAuth a
+withBackend a = do (OAuth be _) <- get
+                   a be
 
 newCSRFToken :: Handler b OAuth Text
 newCSRFToken = gets oAuthRng >>= liftIO . mkCSRFToken
@@ -148,19 +197,21 @@ newCSRFToken = gets oAuthRng >>= liftIO . mkCSRFToken
 -- | Initialize the OAuth snaplet, providing handlers to do actual
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
-oAuthInit :: (AuthorizationRequest -> Handler b OAuth AuthorizationResult)
-          -- ^ A handler to perform authorization against the server.
-          -> (Code -> Handler b OAuth ())
-          -- ^ A handler to display an authorization request 'Code' to clients.
-          -> SnapletInit b OAuth
-oAuthInit authHandler genericCodeDisplay =
+initInMemoryOAuth :: (AuthorizationRequest -> Handler b OAuth AuthorizationResult)
+                  -- ^ A handler to perform authorization against the server.
+                  -> (Code -> Handler b OAuth ())
+                  -- ^ A handler to display an authorization request 'Code' to
+                  -- clients.
+                  -> SnapletInit b OAuth
+initInMemoryOAuth authHandler genericCodeDisplay =
   makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
     addRoutes [ ("/auth", authorizationRequest authHandler genericCodeDisplay)
               , ("/token", requestToken)
               ]
     codeStore <- liftIO $ newIORef Map.empty
+    aliveTokens <- liftIO $ newIORef Set.empty
     rng <- liftIO mkRNG
-    return $ OAuth codeStore rng
+    return $ OAuth (InMemoryOAuth codeStore aliveTokens) rng
 
 --------------------------------------------------------------------------------
 -- | Protect a resource by requiring valid OAuth tokens in the request header
