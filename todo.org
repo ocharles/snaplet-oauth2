@@ -33,6 +33,11 @@
 ***** TODO Implement
 
 
+*** 7
+**** Validate access tokens:
+***** TODO Expiration date
+***** TODO Actually a valid token
 
-*** TODO Unit tests!
-*** TODO Various warnings (failed pattern matches, etc)
+** TODO Unit tests!
+** TODO PostgreSQL backend
+** TODO Various warnings (failed pattern matches, etc)
