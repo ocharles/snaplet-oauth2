@@ -119,6 +119,33 @@ data AccessTokenRequest = AccessTokenRequest
   }
 
 --------------------------------------------------------------------------------
+data AccessTokenError = AccessTokenError
+  { accessTokenErrorCode :: AccessTokenErrorCode
+  , accessTokenErrorBody :: Text
+  }
+
+data AccessTokenErrorCode = InvalidRequest | InvalidClient | InvalidGrant
+                          | UnauthorizedClient | UnsupportedGrantType
+                          | InvalidScope
+
+instance ToJSON AccessTokenError where
+  toJSON (AccessTokenError code body) = object [ "error" .= code
+                                               , "error_description" .= body
+                                               ]
+
+instance ToJSON AccessTokenErrorCode where
+  toJSON = toJSON . asText
+    where
+      asText :: AccessTokenErrorCode -> Text
+      asText c = case c of
+        InvalidRequest -> "invalid_request"
+        InvalidClient -> "invalid_client"
+        InvalidGrant -> "invalid_grant"
+        UnauthorizedClient -> "unauthorized_client"
+        UnsupportedGrantType -> "unsupported_grant_type"
+        InvalidScope -> "invalid_scope"
+
+--------------------------------------------------------------------------------
 data AccessToken = AccessToken
   { accessToken :: Code
   , accessTokenType :: AccessTokenType
@@ -174,16 +201,25 @@ requestToken =
       Just grant ->
         case authGrantRedirectUri grant == accessTokenRedirect tokenReq of
           True -> do
-            token <- newCSRFToken
-            let grantedAccessToken = AccessToken
-                  { accessToken = token
-                  , accessTokenType = Bearer
-                  , accessTokenExpiresIn = 3600
-                  , accessTokenRefreshToken = token
-                  }
-            withBackend $ \be ->
-              eitherT (error . show) tokenGranted (storeToken be grantedAccessToken)
-  where tokenGranted = writeLBS . encode
+            now <- liftIO getCurrentTime
+            case now > authGrantExpiresAt grant of
+              False -> do
+                token <- newCSRFToken
+                let grantedAccessToken = AccessToken
+                      { accessToken = token
+                      , accessTokenType = Bearer
+                      , accessTokenExpiresIn = 3600
+                      , accessTokenRefreshToken = token
+                      }
+                withBackend $ \be ->
+                  eitherT (error . show) writeJSON (storeToken be grantedAccessToken)
+              True -> do
+                modifyResponse (setResponseCode 400)
+                writeJSON $ AccessTokenError InvalidGrant
+                  "This authorization grant has expired"
+  where
+    writeJSON :: (ToJSON a, MonadSnap m) => a -> m ()
+    writeJSON = writeLBS . encode
 
 withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
             -> Handler b OAuth a
