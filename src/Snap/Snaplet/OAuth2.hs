@@ -39,10 +39,25 @@ import Snap.Snaplet
 import Snap.Snaplet.Session.Common
 
 --------------------------------------------------------------------------------
+-- | All storage backends for OAuth must implement the following API. See the
+-- documentation for each method for various invariants that either MUST or
+-- SHOULD be implemented (as defined by RFC-2119).
 class OAuthBackend oauth where
-  storeToken               :: MonadIO m => oauth -> AccessToken -> EitherT Text m AccessToken
-  storeAuthorizationGrant  :: MonadIO m => oauth -> AuthorizationGrant -> EitherT Text m ()
-  lookupAuthorizationGrant :: MonadIO m => oauth -> Code -> m (Maybe AuthorizationGrant)
+  -- | Store an access token that has been granted to a client.
+  storeToken :: MonadIO m => oauth -> AccessToken -> EitherT Text m AccessToken
+
+  -- | Store an authorization grant that has been granted to a client.
+  storeAuthorizationGrant :: MonadIO m => oauth -> AuthorizationGrant -> EitherT Text m ()
+
+  -- | Retrieve an authorization grant from storage for inspection. This is used
+  -- to verify an authorization grant for its validaty against subsequent client
+  -- requests.
+  --
+  -- It is important to ensure that this authorization grant is somehow locked
+  -- so that no other threads can inspect this authorization grant. Failing to
+  -- lock the authorization grant can allow multiple clients to consume an
+  -- authorization grant at the same time, which is forbidden.
+  inspectAuthorizationGrant :: MonadIO m => oauth -> Code -> m (Maybe AuthorizationGrant)
 
 --------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
@@ -58,7 +73,7 @@ instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
     liftIO $ modifyIORef (oAuthGranted be) (Map.insert (authGrantCode grant) grant)
 
-  lookupAuthorizationGrant be code =
+  inspectAuthorizationGrant be code =
     liftIO $ Map.lookup code <$> readIORef (oAuthGranted be)
 
   storeToken be token = do
@@ -153,11 +168,9 @@ data AccessToken = AccessToken
   , accessTokenRefreshToken :: Code
   } deriving (Eq, Ord)
 
---------------------------------------------------------------------------------
 data AccessTokenType = Example | Bearer
   deriving (Eq, Ord, Show)
 
---------------------------------------------------------------------------------
 instance ToJSON AccessToken where
   toJSON at = object [ "access_token" .= accessToken at
                      , "token_type" .= show (accessTokenType at)
@@ -177,7 +190,7 @@ authorizationRequest authHandler genericDisplay =
         code <- newCSRFToken
         now <- liftIO getCurrentTime
         let authGrant = AuthorizationGrant { authGrantCode = code
-                                           , authGrantExpiresAt = addUTCTime (60 * 10) now
+                                           , authGrantExpiresAt = addUTCTime (10) now
                                            , authGrantRedirectUri = authReqRedirectUri authReq
                                            }
         withBackend $ \be ->
@@ -190,10 +203,11 @@ authorizationRequest authHandler genericDisplay =
             Nothing -> genericDisplay code
             Just uri -> error "Redirect to a URI is not yet supported"
 
+--------------------------------------------------------------------------------
 requestToken :: Handler b OAuth ()
 requestToken =
   runParamParser getPostParams parseTokenRequestParameters $ \tokenReq -> do
-    grant' <- withBackend $ \be -> lookupAuthorizationGrant be (accessTokenCode tokenReq)
+    grant' <- withBackend $ \be -> inspectAuthorizationGrant be (accessTokenCode tokenReq)
     case grant' of
       Nothing -> do
         modifyResponse (setResponseCode 400)
