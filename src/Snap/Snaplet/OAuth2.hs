@@ -30,13 +30,15 @@ import           Data.Aeson (ToJSON(..), encode, (.=), object)
 import qualified Data.ByteString.Char8 as BS
 import           Data.IORef
 import qualified Data.Map as Map
+import           Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import           Data.Text (Text, pack)
 import qualified Data.Text as Text
-import           Data.Text.Encoding (decodeUtf8)
+import           Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import           Data.Time (UTCTime, addUTCTime, getCurrentTime)
 import           Data.Tuple (swap)
-import           Network.URI (isAbsoluteURI)
+import           Network.URI (isAbsoluteURI, parseAbsoluteURI, uriQuery)
+import           Network.URL (importParams, exportParams)
 import           Snap.Core
 import           Snap.Snaplet
 import           Snap.Snaplet.Session.Common
@@ -209,8 +211,17 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
     authReqStored (code, authReq) =
       case authReqRedirectUri authReq of
         Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
-        Just uri -> error "Redirect to a URI is not yet supported"
+        Just uri -> redirect $ encodeUtf8 $ augmentRedirect uri code
         Nothing -> genericDisplay code
+
+    augmentRedirect uri code =
+      -- We have already validated this in the request parser.
+      let uri' = fromMaybe (error "Invalid redirect") $ parseAbsoluteURI $
+                   Text.unpack $ decodeUtf8 uri
+      in pack $ show $ uri'
+           { uriQuery = ("?" ++) $ exportParams $
+                        (fromMaybe [] $ importParams $ uriQuery uri') ++
+                        [ ("code", Text.unpack code) ] }
 
     verifyWithResourceOwner authReq = do
       authResult <- lift $ authHandler authReq
