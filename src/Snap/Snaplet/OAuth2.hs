@@ -284,7 +284,9 @@ requestToken = eitherT jsonError success $ do
     jsonError e = modifyResponse (setResponseCode 400) >> writeJSON e
 
     writeJSON :: (ToJSON a, MonadSnap m) => a -> m ()
-    writeJSON = writeLBS . encode
+    writeJSON j = do
+      modifyResponse $ setContentType "application/json"
+      writeLBS $ encode j
 
 
 withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
