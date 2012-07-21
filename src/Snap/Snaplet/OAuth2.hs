@@ -100,11 +100,11 @@ may be multiple page requests to grant authorization (ie, the user accidently
 types invalid input, or uses multifactor authentication). -}
     InProgress
 
-    -- | The request was not approved. The associated string indicates why.
-  | Failed String
+    -- | The request was not approved.
+  | Denied
 
-    -- | Authorization succeeded.
-  | Success
+    -- | The resource owner has granted permission.
+  | Granted
 
 --------------------------------------------------------------------------------
 -- | Information about an authorization request from a client.
@@ -226,7 +226,7 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
     verifyWithResourceOwner authReq = do
       authResult <- lift $ authHandler authReq
       case authResult of
-        Success -> return ()
+        Granted -> return ()
         InProgress -> left $ return ()
 
 --------------------------------------------------------------------------------
