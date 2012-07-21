@@ -17,26 +17,28 @@ module Snap.Snaplet.OAuth2
        , protect
        ) where
 
-import Control.Applicative ((<$>), (<*>), (<*), pure)
-import Control.Error.Util
-import Control.Monad (unless)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Trans.Reader
-import Control.Monad.State.Class (get, gets)
-import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Either
-import Data.Aeson (ToJSON(..), encode, (.=), object)
+import           Control.Applicative ((<$>), (<*>), (<*), pure)
+import           Control.Concurrent.MVar
+import           Control.Error.Util
+import           Control.Monad (unless)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad.State.Class (get, gets)
+import           Control.Monad.Trans (lift)
+import           Control.Monad.Trans.Either
+import           Control.Monad.Trans.Reader
+import           Data.Aeson (ToJSON(..), encode, (.=), object)
 import qualified Data.ByteString.Char8 as BS
+import           Data.IORef
 import qualified Data.Map as Map
 import qualified Data.Set as Set
+import           Data.Text (Text, pack)
 import qualified Data.Text as Text
-import Data.IORef
-import Data.Text (Text, pack)
-import Data.Text.Encoding (decodeUtf8)
-import Data.Time (UTCTime, addUTCTime, getCurrentTime)
-import Snap.Core
-import Snap.Snaplet
-import Snap.Snaplet.Session.Common
+import           Data.Text.Encoding (decodeUtf8)
+import           Data.Time (UTCTime, addUTCTime, getCurrentTime)
+import           Data.Tuple (swap)
+import           Snap.Core
+import           Snap.Snaplet
+import           Snap.Snaplet.Session.Common
 
 --------------------------------------------------------------------------------
 -- | All storage backends for OAuth must implement the following API. See the
@@ -53,10 +55,9 @@ class OAuthBackend oauth where
   -- to verify an authorization grant for its validaty against subsequent client
   -- requests.
   --
-  -- It is important to ensure that this authorization grant is somehow locked
-  -- so that no other threads can inspect this authorization grant. Failing to
-  -- lock the authorization grant can allow multiple clients to consume an
-  -- authorization grant at the same time, which is forbidden.
+  -- This function should remove the authorization grant from storage entirely
+  -- so that subsequent calls to 'inspectAuthorizationGrant' with the same
+  -- parameters return 'Nothing'.
   inspectAuthorizationGrant :: oauth -> Code -> IO (Maybe AuthorizationGrant)
 
 --------------------------------------------------------------------------------
@@ -65,16 +66,18 @@ type Code = Text
 
 --------------------------------------------------------------------------------
 data InMemoryOAuth = InMemoryOAuth
-  { oAuthGranted :: IORef (Map.Map Code AuthorizationGrant)
+  { oAuthGranted :: MVar (Map.Map Code AuthorizationGrant)
   , oAuthAliveTokens :: IORef (Set.Set AccessToken)
   }
 
 instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
-    modifyIORef (oAuthGranted be) (Map.insert (authGrantCode grant) grant)
+    modifyMVar_ (oAuthGranted be) $
+      return . (Map.insert (authGrantCode grant) grant)
 
   inspectAuthorizationGrant be code =
-    Map.lookup code <$> readIORef (oAuthGranted be)
+    modifyMVar (oAuthGranted be) $
+      return . (swap . Map.updateLookupWithKey (const (const Nothing)) code)
 
   storeToken be token =
     modifyIORef (oAuthAliveTokens be) (Set.insert token)
@@ -301,7 +304,7 @@ initInMemoryOAuth authHandler genericCodeDisplay =
     addRoutes [ ("/auth", authorizationRequest authHandler genericCodeDisplay)
               , ("/token", requestToken)
               ]
-    codeStore <- liftIO $ newIORef Map.empty
+    codeStore <- liftIO $ newMVar Map.empty
     aliveTokens <- liftIO $ newIORef Set.empty
     rng <- liftIO mkRNG
     return $ OAuth (InMemoryOAuth codeStore aliveTokens) rng
