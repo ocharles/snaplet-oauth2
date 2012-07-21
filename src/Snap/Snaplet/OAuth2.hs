@@ -139,31 +139,31 @@ data AccessTokenRequest = AccessTokenRequest
   }
 
 --------------------------------------------------------------------------------
-data AccessTokenError = AccessTokenError
-  { accessTokenErrorCode :: AccessTokenErrorCode
-  , accessTokenErrorBody :: Text
-  }
+data Error = Error { errorCode :: ErrorCode
+                   , errorBody :: Text
+                   }
 
-data AccessTokenErrorCode = InvalidRequest | InvalidClient | InvalidGrant
-                          | UnauthorizedClient | UnsupportedGrantType
-                          | InvalidScope
+data ErrorCode = InvalidRequest | InvalidClient | InvalidGrant
+               | UnauthorizedClient | UnsupportedGrantType
+               | InvalidScope | AccessDenied
 
-instance ToJSON AccessTokenError where
-  toJSON (AccessTokenError code body) = object [ "error" .= code
-                                               , "error_description" .= body
-                                               ]
+instance Show ErrorCode where
+  show c = case c of
+    InvalidRequest -> "invalid_request"
+    InvalidClient -> "invalid_client"
+    InvalidGrant -> "invalid_grant"
+    UnauthorizedClient -> "unauthorized_client"
+    UnsupportedGrantType -> "unsupported_grant_type"
+    InvalidScope -> "invalid_scope"
+    AccessDenied -> "access_denied"
 
-instance ToJSON AccessTokenErrorCode where
-  toJSON = toJSON . asText
-    where
-      asText :: AccessTokenErrorCode -> Text
-      asText c = case c of
-        InvalidRequest -> "invalid_request"
-        InvalidClient -> "invalid_client"
-        InvalidGrant -> "invalid_grant"
-        UnauthorizedClient -> "unauthorized_client"
-        UnsupportedGrantType -> "unsupported_grant_type"
-        InvalidScope -> "invalid_scope"
+instance ToJSON Error where
+  toJSON (Error code body) = object [ "error" .= code
+                                    , "error_description" .= body
+                                    ]
+
+instance ToJSON ErrorCode where
+  toJSON = toJSON . show
 
 --------------------------------------------------------------------------------
 data AccessToken = AccessToken
@@ -207,34 +207,44 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
     lift (withBackend' $ \be -> storeAuthorizationGrant be authGrant) >>= liftIO
 
     return (code, authReq)
+
   where
     authReqStored (code, authReq) =
       case authReqRedirectUri authReq of
         Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
-        Just uri -> redirect $ encodeUtf8 $ augmentRedirect uri code
+        Just uri -> augmentedRedirect uri [ ("code", Text.unpack code) ]
         Nothing -> genericDisplay code
 
-    augmentRedirect uri code =
+    augmentedRedirect uri params =
       -- We have already validated this in the request parser.
       let uri' = fromMaybe (error "Invalid redirect") $ parseAbsoluteURI $
                    Text.unpack $ decodeUtf8 uri
-      in pack $ show $ uri'
+      in redirect $ encodeUtf8 $ pack $ show $ uri'
            { uriQuery = ("?" ++) $ exportParams $
                         (fromMaybe [] $ importParams $ uriQuery uri') ++
-                        [ ("code", Text.unpack code) ] }
+                        params }
 
     verifyWithResourceOwner authReq = do
       authResult <- lift $ authHandler authReq
       case authResult of
-        Granted -> return ()
-        InProgress -> left $ return ()
+        Granted    -> right ()
+        InProgress -> lift $ getResponse >>= finishWith
+        Denied     -> left $ redirectError authReq $ Error AccessDenied
+                        "The resource owner has denied this request"
+
+    redirectError authReq error = do
+      case authReqRedirectUri authReq of
+        Just uri -> augmentedRedirect uri
+                      [ ("error", show $ errorCode error)
+                      , ("error_description", Text.unpack $ errorBody error)
+                      ]
 
 --------------------------------------------------------------------------------
 requestToken :: Handler b OAuth ()
 requestToken = eitherT jsonError success $ do
     -- Parse the request into a AccessTokenRequest.
     tokenReq <- runParamParser getPostParams parseTokenRequestParameters
-                  (AccessTokenError InvalidRequest)
+                  (Error InvalidRequest)
 
     -- Find the authorization grant, failing if it can't be found.
     grant <- noteT (notFound tokenReq) . liftMaybe =<< liftIO =<< lift
@@ -267,14 +277,14 @@ requestToken = eitherT jsonError success $ do
     success :: AccessToken -> Handler b OAuth ()
     success = writeJSON
 
-    notFound tokenReq = AccessTokenError InvalidGrant
+    notFound tokenReq = Error InvalidGrant
       (Text.append "Authorization request not found: " $
          accessTokenCode tokenReq)
 
-    expired = AccessTokenError InvalidGrant
+    expired = Error InvalidGrant
       "This authorization grant has expired"
 
-    mismatchedClientRedirect = AccessTokenError InvalidGrant $
+    mismatchedClientRedirect = Error InvalidGrant $
       Text.append "The redirection URL does not match the redirection URL in "
         "the original authorization grant"
 
