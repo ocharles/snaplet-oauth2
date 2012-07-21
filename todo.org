@@ -19,7 +19,7 @@
 ****** DONE If an authorization code is used more than once the request must be denied
 
 ****** 4.1.2.1. Error Response
-******* DONE Implement!
+******* TODO Implement!
 ***** 4.1.3. Access Token Request
 ****** TODO Ensure that the auth code was given to the correct client
 ****** DONE Verify the auth code is valid
