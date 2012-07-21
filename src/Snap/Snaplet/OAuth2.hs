@@ -130,12 +130,14 @@ data AuthorizationGrant = AuthorizationGrant
   { authGrantCode :: Code
   , authGrantExpiresAt :: UTCTime
   , authGrantRedirectUri :: Maybe BS.ByteString
+  , authGrantClientId :: Text
   }
 
 --------------------------------------------------------------------------------
 data AccessTokenRequest = AccessTokenRequest
-  { accessTokenCode :: Code
-  , accessTokenRedirect :: Maybe BS.ByteString
+  { accessTokenReqCode :: Code
+  , accessTokenReqRedirect :: Maybe BS.ByteString
+  , accessTokenReqClientId :: Text
   }
 
 --------------------------------------------------------------------------------
@@ -171,6 +173,7 @@ data AccessToken = AccessToken
   , accessTokenType :: AccessTokenType
   , accessTokenExpiresIn :: Int
   , accessTokenRefreshToken :: Code
+  , accessTokenClientId :: Text
   } deriving (Eq, Ord)
 
 data AccessTokenType = Example | Bearer
@@ -203,6 +206,7 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
           { authGrantCode = code
           , authGrantExpiresAt = addUTCTime 600 now
           , authGrantRedirectUri = authReqRedirectUri authReq
+          , authGrantClientId = authReqClientId authReq
           }
     lift (withBackend' $ \be -> storeAuthorizationGrant be authGrant) >>= liftIO
 
@@ -249,12 +253,17 @@ requestToken = eitherT jsonError success $ do
     -- Find the authorization grant, failing if it can't be found.
     grant <- noteT (notFound tokenReq) . liftMaybe =<< liftIO =<< lift
                (withBackend' $
-                  \be -> inspectAuthorizationGrant be (accessTokenCode tokenReq))
+                  \be -> inspectAuthorizationGrant be
+                           (accessTokenReqCode tokenReq))
 
     -- Require that the current redirect URL matches the one an authorization
     -- token was granted to.
-    (authGrantRedirectUri grant == accessTokenRedirect tokenReq)
+    (authGrantRedirectUri grant == accessTokenReqRedirect tokenReq)
       `orFail` mismatchedClientRedirect
+
+    -- Require that the client IDs match.
+    (accessTokenReqClientId tokenReq == authGrantClientId grant)
+      `orFail` mismatchedClient
 
     -- Require that the token has not expired.
     now <- liftIO getCurrentTime
@@ -267,6 +276,7 @@ requestToken = eitherT jsonError success $ do
           , accessTokenType = Bearer
           , accessTokenExpiresIn = 3600
           , accessTokenRefreshToken = token
+          , accessTokenClientId = accessTokenReqClientId tokenReq
           }
 
     -- Store the granted access token, handling backend failure.
@@ -279,10 +289,13 @@ requestToken = eitherT jsonError success $ do
 
     notFound tokenReq = Error InvalidGrant
       (Text.append "Authorization request not found: " $
-         accessTokenCode tokenReq)
+         accessTokenReqCode tokenReq)
 
     expired = Error InvalidGrant
       "This authorization grant has expired"
+
+    mismatchedClient = Error InvalidGrant
+      "This authorization token was issued to another client"
 
     mismatchedClientRedirect = Error InvalidGrant $
       Text.append "The redirection URL does not match the redirection URL in "
@@ -377,10 +390,8 @@ optional name predicate e = do
 parseAuthorizationRequestParameters :: ParameterParser AuthorizationRequest
 parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
-  <*> fmap decodeUtf8 (require "client_id" (const True) "")
-  <*> optional "redirect_uri" validRedirectUri
-        (Text.append "redirect_uri must be an absolute URI and not contain a "
-           "fragment component")
+  <*> clientIdField
+  <*> redirectUriField
   <*> fmap (fmap decodeUtf8) (optional "scope" validScope "")
   <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
 
@@ -389,9 +400,13 @@ parseTokenRequestParameters = pure AccessTokenRequest
   <*  require "grant_type" (== "authorization_code")
         "grant_type must be authorization_code"
   <*> fmap decodeUtf8 (require "code" (const True) "")
-  <*> optional "redirect_uri" validRedirectUri
-        (Text.append "redirect_uri must be an absolute URI and not contain a "
-           "fragment component")
+  <*> redirectUriField
+  <*> clientIdField
+
+clientIdField = fmap decodeUtf8 (require "client_id" (const True) "")
+redirectUriField = optional "redirect_uri" validRedirectUri
+  (Text.append "redirect_uri must be an absolute URI and not contain a "
+               "fragment component")
 
 validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
 validScope _  = True
