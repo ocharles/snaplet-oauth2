@@ -44,10 +44,10 @@ import Snap.Snaplet.Session.Common
 -- SHOULD be implemented (as defined by RFC-2119).
 class OAuthBackend oauth where
   -- | Store an access token that has been granted to a client.
-  storeToken :: MonadIO m => oauth -> AccessToken -> EitherT Text m AccessToken
+  storeToken :: oauth -> AccessToken -> IO ()
 
   -- | Store an authorization grant that has been granted to a client.
-  storeAuthorizationGrant :: MonadIO m => oauth -> AuthorizationGrant -> EitherT Text m ()
+  storeAuthorizationGrant :: oauth -> AuthorizationGrant -> IO ()
 
   -- | Retrieve an authorization grant from storage for inspection. This is used
   -- to verify an authorization grant for its validaty against subsequent client
@@ -57,7 +57,7 @@ class OAuthBackend oauth where
   -- so that no other threads can inspect this authorization grant. Failing to
   -- lock the authorization grant can allow multiple clients to consume an
   -- authorization grant at the same time, which is forbidden.
-  inspectAuthorizationGrant :: MonadIO m => oauth -> Code -> m (Maybe AuthorizationGrant)
+  inspectAuthorizationGrant :: oauth -> Code -> IO (Maybe AuthorizationGrant)
 
 --------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
@@ -71,14 +71,13 @@ data InMemoryOAuth = InMemoryOAuth
 
 instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
-    liftIO $ modifyIORef (oAuthGranted be) (Map.insert (authGrantCode grant) grant)
+    modifyIORef (oAuthGranted be) (Map.insert (authGrantCode grant) grant)
 
   inspectAuthorizationGrant be code =
-    liftIO $ Map.lookup code <$> readIORef (oAuthGranted be)
+    Map.lookup code <$> readIORef (oAuthGranted be)
 
-  storeToken be token = do
-    liftIO $ modifyIORef (oAuthAliveTokens be) (Set.insert token)
-    return token
+  storeToken be token =
+    modifyIORef (oAuthAliveTokens be) (Set.insert token)
 
 {-| The OAuth snaplet. You should nest this inside your application snaplet
 using 'nestSnaplet' with the 'initInMemoryOAuth' initializer. -}
@@ -179,66 +178,101 @@ instance ToJSON AccessToken where
                      ]
 
 --------------------------------------------------------------------------------
-authorizationRequest :: (AuthorizationRequest -> Handler b OAuth AuthorizationResult)
+authorizationRequest :: (AuthorizationRequest
+                     -> Handler b OAuth AuthorizationResult)
                      -> (Code -> Handler b OAuth ())
                      -> Handler b OAuth ()
-authorizationRequest authHandler genericDisplay =
-  runParamParser getQueryParams parseAuthorizationRequestParameters $ \authReq -> do
-    authResult <- authHandler authReq
-    case authResult of
-      Success -> do
-        code <- newCSRFToken
-        now <- liftIO getCurrentTime
-        let authGrant = AuthorizationGrant { authGrantCode = code
-                                           , authGrantExpiresAt = addUTCTime (10) now
-                                           , authGrantRedirectUri = authReqRedirectUri authReq
-                                           }
-        withBackend $ \be ->
-          eitherT (error . show) (const $ authReqStored code authReq)
-            (storeAuthorizationGrant be authGrant)
-      InProgress -> return ()
-  where authReqStored code authReq =
-          case authReqRedirectUri authReq of
-            Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
-            Nothing -> genericDisplay code
-            Just uri -> error "Redirect to a URI is not yet supported"
+authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
+    -- Parse the request for validity.
+    authReq <- runParamParser getQueryParams parseAuthorizationRequestParameters
+
+    -- Confirm with the resource owner that they wish to grant this request.
+    verifyWithResourceOwner authReq
+
+    -- Produce a new authorization code.
+    code <- lift newCSRFToken
+    now <- liftIO getCurrentTime
+    let authGrant = AuthorizationGrant
+          { authGrantCode = code
+          , authGrantExpiresAt = addUTCTime 600 now
+          , authGrantRedirectUri = authReqRedirectUri authReq
+          }
+    lift (withBackend' $ \be -> storeAuthorizationGrant be authGrant) >>= liftIO
+
+    return (code, authReq)
+  where
+    authReqStored (code, authReq) =
+      case authReqRedirectUri authReq of
+        Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
+        Just uri -> error "Redirect to a URI is not yet supported"
+        Nothing -> genericDisplay code
+
+    verifyWithResourceOwner authReq = do
+      authResult <- lift $ authHandler authReq
+      case authResult of
+        Success -> return ()
+        InProgress -> left $ return ()
 
 --------------------------------------------------------------------------------
 requestToken :: Handler b OAuth ()
-requestToken =
-  runParamParser getPostParams parseTokenRequestParameters $ \tokenReq -> do
-    grant' <- withBackend $ \be -> inspectAuthorizationGrant be (accessTokenCode tokenReq)
-    case grant' of
-      Nothing -> do
-        modifyResponse (setResponseCode 400)
-        writeText $ Text.append (pack "Authorization request not found: ") (accessTokenCode tokenReq)
-      Just grant ->
-        case authGrantRedirectUri grant == accessTokenRedirect tokenReq of
-          True -> do
-            now <- liftIO getCurrentTime
-            case now > authGrantExpiresAt grant of
-              False -> do
-                token <- newCSRFToken
-                let grantedAccessToken = AccessToken
-                      { accessToken = token
-                      , accessTokenType = Bearer
-                      , accessTokenExpiresIn = 3600
-                      , accessTokenRefreshToken = token
-                      }
-                withBackend $ \be ->
-                  eitherT (error . show) writeJSON (storeToken be grantedAccessToken)
-              True -> do
-                modifyResponse (setResponseCode 400)
-                writeJSON $ AccessTokenError InvalidGrant
-                  "This authorization grant has expired"
+requestToken = eitherT id writeJSON $ do
+    -- Parse the request into a AccessTokenRequest.
+    tokenReq <- runParamParser getPostParams parseTokenRequestParameters
+
+    -- Find the authorization grant, failing if it can't be found.
+    grant <- noteT (notFound tokenReq) . liftMaybe =<< liftIO =<< lift
+               (withBackend' $
+                  \be -> inspectAuthorizationGrant be (accessTokenCode tokenReq))
+
+    -- Require that the current redirect URL matches the one an authorization
+    -- token was granted to.
+    (authGrantRedirectUri grant == accessTokenRedirect tokenReq)
+      `orFail` mismatchedClientRedirect
+
+    -- Require that the token has not expired.
+    now <- liftIO getCurrentTime
+    (now <= authGrantExpiresAt grant) `orFail` expired
+
+    -- All good, grant a new access token!
+    token <- lift newCSRFToken
+    let grantedAccessToken = AccessToken
+          { accessToken = token
+          , accessTokenType = Bearer
+          , accessTokenExpiresIn = 3600
+          , accessTokenRefreshToken = token
+          }
+
+    -- Store the granted access token, handling backend failure.
+    lift (withBackend' $ \be -> storeToken be grantedAccessToken) >>= liftIO
+
   where
     writeJSON :: (ToJSON a, MonadSnap m) => a -> m ()
     writeJSON = writeLBS . encode
+
+    notFound tokenReq = do
+      modifyResponse (setResponseCode 400)
+      writeText $ Text.append (pack "Authorization request not found: ")
+                              (accessTokenCode tokenReq)
+
+    mismatchedClientRedirect = return ()
+
+    orFail True _ = return ()
+    orFail False a = left a
+
+    expired = do
+      modifyResponse (setResponseCode 400)
+      writeJSON $
+        AccessTokenError InvalidGrant "This authorization grant has expired"
 
 withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
             -> Handler b OAuth a
 withBackend a = do (OAuth be _) <- get
                    a be
+
+withBackend' :: (forall o. (OAuthBackend o) => o -> a)
+             -> Handler b OAuth a
+withBackend' a = do (OAuth be _) <- get
+                    return $ a be
 
 newCSRFToken :: Handler b OAuth Text
 newCSRFToken = gets oAuthRng >>= liftIO . mkCSRFToken
@@ -247,7 +281,8 @@ newCSRFToken = gets oAuthRng >>= liftIO . mkCSRFToken
 -- | Initialize the OAuth snaplet, providing handlers to do actual
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
-initInMemoryOAuth :: (AuthorizationRequest -> Handler b OAuth AuthorizationResult)
+initInMemoryOAuth :: (AuthorizationRequest
+                  -> Handler b OAuth AuthorizationResult)
                   -- ^ A handler to perform authorization against the server.
                   -> (Code -> Handler b OAuth ())
                   -- ^ A handler to display an authorization request 'Code' to
@@ -272,31 +307,32 @@ protect :: Handler b OAuth ()
         -- ^ The handler to run on sucessful authentication.
         -> Handler b OAuth ()
 protect failure h = do
-  authHead <- fmap (take 2 . BS.words) <$> withRequest (return . getHeader "Authorization")
+  authHead <- fmap (take 2 . BS.words) <$>
+                withRequest (return . getHeader "Authorization")
   case authHead of
     Just ["Bearer", token] -> h
     _ -> failure
 
 --------------------------------------------------------------------------------
-{-
-Parameter parsers are a combination of 'Reader'/'EitherT' monads. The environment
-is a 'Params' map (from Snap), and 'EitherT' allows us to fail validation at any
-point. Combinators 'require' and 'optional' take a parameter key, and a
-validation routine.
--}
+{- Parameter parsers are a combination of 'Reader'/'EitherT' monads. The
+environment is a 'Params' map (from Snap), and 'EitherT' allows us to fail
+validation at any point. Combinators 'require' and 'optional' take a parameter
+key, and a validation routine.  -}
 
 type ParameterParser a = EitherT String (Reader Params) a
 
 param :: String -> ParameterParser (Maybe BS.ByteString)
 param p = fmap head . Map.lookup (BS.pack p) <$> lift ask
 
-require :: String -> (BS.ByteString -> Bool) -> String -> ParameterParser BS.ByteString
+require :: String -> (BS.ByteString -> Bool) -> String
+        -> ParameterParser BS.ByteString
 require name predicate e = do
   v <- param name >>= noteT (name ++ " is required") . liftMaybe
   unless (predicate v) $ left e
   return v
 
-optional :: String -> (BS.ByteString -> Bool) -> String -> ParameterParser (Maybe BS.ByteString)
+optional :: String -> (BS.ByteString -> Bool) -> String
+         -> ParameterParser (Maybe BS.ByteString)
 optional name predicate e = do
   v <- param name
   case v of
@@ -308,23 +344,27 @@ parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
   <*> fmap decodeUtf8 (require "client_id" (const True) "")
   <*> optional "redirect_uri" validRedirectUri
-        "redirect_uri must be an absolute URI and not contain a fragment component"
+        ("redirect_uri must be an absolute URI and not contain a " ++
+         "fragment component")
   <*> fmap (fmap decodeUtf8) (optional "scope" validScope "")
   <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
 
 parseTokenRequestParameters :: ParameterParser AccessTokenRequest
 parseTokenRequestParameters = pure AccessTokenRequest
-  <*  require "grant_type" (== "authorization_code") "grant_type must be authorization_code"
+  <*  require "grant_type" (== "authorization_code")
+        "grant_type must be authorization_code"
   <*> fmap decodeUtf8 (require "code" (const True) "")
   <*> optional "redirect_uri" validRedirectUri
-        "redirect_uri must be an absolute URI and not contain a fragment component"
+        ("redirect_uri must be an absolute URI and not contain a " ++
+         "fragment component")
 
 validRedirectUri _ = True
 validScope _  = True
 
-runParamParser :: Handler b OAuth Params -> ParameterParser a -> (a -> Handler b OAuth ()) -> Handler b OAuth ()
-runParamParser params parser handler = do
-  qps <- params
+runParamParser :: MonadSnap m => m Params -> ParameterParser a
+               -> EitherT (m ()) m a
+runParamParser params parser = do
+  qps <- lift params
   case runReader (runEitherT parser) qps of
-    Left e -> writeText $ pack e
-    Right a -> handler a
+    Left e -> left (writeText $ pack e)
+    Right a -> right a
