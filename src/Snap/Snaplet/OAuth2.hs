@@ -36,6 +36,7 @@ import qualified Data.Text as Text
 import           Data.Text.Encoding (decodeUtf8)
 import           Data.Time (UTCTime, addUTCTime, getCurrentTime)
 import           Data.Tuple (swap)
+import           Network.URI (isAbsoluteURI)
 import           Snap.Core
 import           Snap.Snaplet
 import           Snap.Snaplet.Session.Common
@@ -369,7 +370,7 @@ parseTokenRequestParameters = pure AccessTokenRequest
         (Text.append "redirect_uri must be an absolute URI and not contain a "
            "fragment component")
 
-validRedirectUri _ = True
+validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
 validScope _  = True
 
 runParamParser :: MonadSnap m => m Params -> ParameterParser a -> (Text -> e)

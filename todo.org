@@ -6,7 +6,7 @@
 **** TODO Ignore request parameters with no value
 **** TODO Implict grants
 **** TODO [3.1.1] Return an error for unknown response_types
-**** TODO Mandadate redirection URIs are absolute, valid and contains no fragment component
+**** DONE Mandadate redirection URIs are absolute, valid and contains no fragment component
 **** TODO Mandate POST to get tokens
 
 
