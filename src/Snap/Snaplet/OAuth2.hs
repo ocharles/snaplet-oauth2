@@ -185,6 +185,7 @@ authorizationRequest :: (AuthorizationRequest
 authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
     -- Parse the request for validity.
     authReq <- runParamParser getQueryParams parseAuthorizationRequestParameters
+                 writeText
 
     -- Confirm with the resource owner that they wish to grant this request.
     verifyWithResourceOwner authReq
@@ -215,9 +216,10 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
 
 --------------------------------------------------------------------------------
 requestToken :: Handler b OAuth ()
-requestToken = eitherT id writeJSON $ do
+requestToken = eitherT jsonError success $ do
     -- Parse the request into a AccessTokenRequest.
     tokenReq <- runParamParser getPostParams parseTokenRequestParameters
+                  (AccessTokenError InvalidRequest)
 
     -- Find the authorization grant, failing if it can't be found.
     grant <- noteT (notFound tokenReq) . liftMaybe =<< liftIO =<< lift
@@ -244,25 +246,31 @@ requestToken = eitherT id writeJSON $ do
 
     -- Store the granted access token, handling backend failure.
     lift (withBackend' $ \be -> storeToken be grantedAccessToken) >>= liftIO
+    return grantedAccessToken
 
   where
+    success :: AccessToken -> Handler b OAuth ()
+    success = writeJSON
+
+    notFound tokenReq = AccessTokenError InvalidGrant
+      (Text.append "Authorization request not found: " $
+         accessTokenCode tokenReq)
+
+    expired = AccessTokenError InvalidGrant
+      "This authorization grant has expired"
+
+    mismatchedClientRedirect = AccessTokenError InvalidGrant $
+      Text.append "The redirection URL does not match the redirection URL in "
+        "the original authorization grant"
+
+    True  `orFail` _ = return ()
+    False `orFail` a = left a
+
+    jsonError e = modifyResponse (setResponseCode 400) >> writeJSON e
+
     writeJSON :: (ToJSON a, MonadSnap m) => a -> m ()
     writeJSON = writeLBS . encode
 
-    notFound tokenReq = do
-      modifyResponse (setResponseCode 400)
-      writeText $ Text.append (pack "Authorization request not found: ")
-                              (accessTokenCode tokenReq)
-
-    mismatchedClientRedirect = return ()
-
-    orFail True _ = return ()
-    orFail False a = left a
-
-    expired = do
-      modifyResponse (setResponseCode 400)
-      writeJSON $
-        AccessTokenError InvalidGrant "This authorization grant has expired"
 
 withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
             -> Handler b OAuth a
@@ -319,19 +327,19 @@ environment is a 'Params' map (from Snap), and 'EitherT' allows us to fail
 validation at any point. Combinators 'require' and 'optional' take a parameter
 key, and a validation routine.  -}
 
-type ParameterParser a = EitherT String (Reader Params) a
+type ParameterParser a = EitherT Text (Reader Params) a
 
 param :: String -> ParameterParser (Maybe BS.ByteString)
 param p = fmap head . Map.lookup (BS.pack p) <$> lift ask
 
-require :: String -> (BS.ByteString -> Bool) -> String
+require :: String -> (BS.ByteString -> Bool) -> Text
         -> ParameterParser BS.ByteString
 require name predicate e = do
-  v <- param name >>= noteT (name ++ " is required") . liftMaybe
+  v <- param name >>= noteT (Text.append (pack name) " is required") . liftMaybe
   unless (predicate v) $ left e
   return v
 
-optional :: String -> (BS.ByteString -> Bool) -> String
+optional :: String -> (BS.ByteString -> Bool) -> Text
          -> ParameterParser (Maybe BS.ByteString)
 optional name predicate e = do
   v <- param name
@@ -344,8 +352,8 @@ parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
   <*> fmap decodeUtf8 (require "client_id" (const True) "")
   <*> optional "redirect_uri" validRedirectUri
-        ("redirect_uri must be an absolute URI and not contain a " ++
-         "fragment component")
+        (Text.append "redirect_uri must be an absolute URI and not contain a "
+           "fragment component")
   <*> fmap (fmap decodeUtf8) (optional "scope" validScope "")
   <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
 
@@ -355,16 +363,16 @@ parseTokenRequestParameters = pure AccessTokenRequest
         "grant_type must be authorization_code"
   <*> fmap decodeUtf8 (require "code" (const True) "")
   <*> optional "redirect_uri" validRedirectUri
-        ("redirect_uri must be an absolute URI and not contain a " ++
-         "fragment component")
+        (Text.append "redirect_uri must be an absolute URI and not contain a "
+           "fragment component")
 
 validRedirectUri _ = True
 validScope _  = True
 
-runParamParser :: MonadSnap m => m Params -> ParameterParser a
-               -> EitherT (m ()) m a
-runParamParser params parser = do
+runParamParser :: MonadSnap m => m Params -> ParameterParser a -> (Text -> e)
+               -> EitherT e m a
+runParamParser params parser errorFmt = do
   qps <- lift params
   case runReader (runEitherT parser) qps of
-    Left e -> left (writeText $ pack e)
+    Left e -> left (errorFmt e)
     Right a -> right a
