@@ -2,46 +2,52 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE Rank2Types #-}
 module Snap.Snaplet.OAuth2
-       ( -- * Snaplet Definition
-         OAuth
-       , initInMemoryOAuth
+    ( -- * Snaplet Definition
+      OAuth
+    , initInMemoryOAuth
 
-         -- * Authorization Handlers
-       , AuthorizationResult(..)
-       , AuthorizationRequest
-       , Code
-       , authReqClientId, authReqRedirectUri
-       , authReqScope, authReqState
+      -- * Authorization Snap.Handlers
+    , AuthorizationResult(..)
+    , AuthorizationRequest
+    , Code
+    , authReqClientId
+    , authReqRedirectUri
+    , authReqScope
+    , authReqState
 
-         -- * Defining Protected Resources
-       , protect
-       ) where
+      -- * Defining Protected Resources
+    , protect
+    ) where
 
-import           Control.Applicative ((<$>), (<*>), (<*), pure)
-import           Control.Concurrent.MVar
-import           Control.Error.Util
-import           Control.Monad (unless)
-import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.State.Class (get, gets)
-import           Control.Monad.Trans (lift)
-import           Control.Monad.Trans.Either
-import           Control.Monad.Trans.Reader
-import           Data.Aeson (ToJSON(..), encode, (.=), object)
+--------------------------------------------------------------------------------
+import Control.Applicative ((<$>), (<*>), (<*), pure)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.State.Class (get, gets)
+import Control.Monad.Trans (lift)
+import Control.Monad (unless)
+import Data.Aeson (ToJSON(..), encode, (.=), object)
+import Data.Maybe (fromMaybe)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
+import Data.Text (Text, pack)
+import Data.Time (UTCTime, addUTCTime, getCurrentTime)
+import Data.Tuple (swap)
+import Network.URI (isAbsoluteURI, parseAbsoluteURI, uriQuery)
+import Network.URL (importParams, exportParams)
+
+
+--------------------------------------------------------------------------------
+import qualified Control.Concurrent.MVar as MVar
+import qualified Control.Error as Error
+import qualified Control.Monad.Trans.Reader as Reader
 import qualified Data.ByteString.Char8 as BS
-import           Data.IORef
+import qualified Data.IORef as IORef
 import qualified Data.Map as Map
-import           Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
-import           Data.Text (Text, pack)
 import qualified Data.Text as Text
-import           Data.Text.Encoding (decodeUtf8, encodeUtf8)
-import           Data.Time (UTCTime, addUTCTime, getCurrentTime)
-import           Data.Tuple (swap)
-import           Network.URI (isAbsoluteURI, parseAbsoluteURI, uriQuery)
-import           Network.URL (importParams, exportParams)
-import           Snap.Core
-import           Snap.Snaplet
-import           Snap.Snaplet.Session.Common
+import qualified Snap.Core as Snap
+import qualified Snap.Snaplet as Snap
+import qualified Snap.Snaplet.Session.Common as Snap
+
 
 --------------------------------------------------------------------------------
 -- | All storage backends for OAuth must implement the following API. See the
@@ -69,27 +75,27 @@ type Code = Text
 
 --------------------------------------------------------------------------------
 data InMemoryOAuth = InMemoryOAuth
-  { oAuthGranted :: MVar (Map.Map Code AuthorizationGrant)
-  , oAuthAliveTokens :: IORef (Set.Set AccessToken)
+  { oAuthGranted :: MVar.MVar (Map.Map Code AuthorizationGrant)
+  , oAuthAliveTokens :: IORef.IORef (Set.Set AccessToken)
   }
 
 instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
-    modifyMVar_ (oAuthGranted be) $
+    MVar.modifyMVar_ (oAuthGranted be) $
       return . (Map.insert (authGrantCode grant) grant)
 
   inspectAuthorizationGrant be code =
-    modifyMVar (oAuthGranted be) $
+    MVar.modifyMVar (oAuthGranted be) $
       return . (swap . Map.updateLookupWithKey (const (const Nothing)) code)
 
   storeToken be token =
-    modifyIORef (oAuthAliveTokens be) (Set.insert token)
+    IORef.modifyIORef (oAuthAliveTokens be) (Set.insert token)
 
 {-| The OAuth snaplet. You should nest this inside your application snaplet
 using 'nestSnaplet' with the 'initInMemoryOAuth' initializer. -}
 data OAuth = forall o. OAuthBackend o => OAuth
   { oAuthBackend :: o
-  , oAuthRng :: RNG
+  , oAuthRng :: Snap.RNG
   }
 
 --------------------------------------------------------------------------------
@@ -187,14 +193,13 @@ instance ToJSON AccessToken where
                      ]
 
 --------------------------------------------------------------------------------
-authorizationRequest :: (AuthorizationRequest
-                     -> Handler b OAuth AuthorizationResult)
-                     -> (Code -> Handler b OAuth ())
-                     -> Handler b OAuth ()
-authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
+authorizationRequest :: (AuthorizationRequest -> Snap.Handler b OAuth AuthorizationResult)
+                     -> (Code -> Snap.Handler b OAuth ())
+                     -> Snap.Handler b OAuth ()
+authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ do
     -- Parse the request for validity.
-    authReq <- runParamParser getQueryParams parseAuthorizationRequestParameters
-                 writeText
+    authReq <- runParamParser Snap.getQueryParams parseAuthorizationRequestParameters
+                 Snap.writeText
 
     -- Confirm with the resource owner that they wish to grant this request.
     verifyWithResourceOwner authReq
@@ -223,17 +228,17 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
       -- We have already validated this in the request parser.
       let uri' = fromMaybe (error "Invalid redirect") $ parseAbsoluteURI $
                    Text.unpack $ decodeUtf8 uri
-      in redirect $ encodeUtf8 $ pack $ show $ uri'
+      in Snap.redirect $ encodeUtf8 $ pack $ show $ uri'
            { uriQuery = ("?" ++) $ exportParams $
                         (fromMaybe [] $ importParams $ uriQuery uri') ++
                         params }
 
     verifyWithResourceOwner authReq = do
-      authResult <- lift $ authHandler authReq
+      authResult <- lift $ authSnap authReq
       case authResult of
-        Granted    -> right ()
-        InProgress -> lift $ getResponse >>= finishWith
-        Denied     -> left $ redirectError authReq $ Error AccessDenied
+        Granted    -> Error.right ()
+        InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
+        Denied     -> Error.left $ redirectError authReq $ Error AccessDenied
                         "The resource owner has denied this request"
 
     redirectError authReq error = do
@@ -244,17 +249,19 @@ authorizationRequest authHandler genericDisplay = eitherT id authReqStored $ do
                       ]
 
 --------------------------------------------------------------------------------
-requestToken :: Handler b OAuth ()
-requestToken = eitherT jsonError success $ do
+requestToken :: Snap.Handler b OAuth ()
+requestToken = Error.eitherT jsonError success $ do
     -- Parse the request into a AccessTokenRequest.
-    tokenReq <- runParamParser getPostParams parseTokenRequestParameters
+    tokenReq <- runParamParser Snap.getPostParams parseTokenRequestParameters
                   (Error InvalidRequest)
 
     -- Find the authorization grant, failing if it can't be found.
-    grant <- noteT (notFound tokenReq) . liftMaybe =<< liftIO =<< lift
-               (withBackend' $
-                  \be -> inspectAuthorizationGrant be
-                           (accessTokenReqCode tokenReq))
+    -- Error.EitherT $ (fmap.fmap) (Error.note (notFound tokenReq)) $
+    grant <- do
+      ioGrant <- lift $ withBackend' $ \be -> inspectAuthorizationGrant be
+                   (accessTokenReqCode tokenReq)
+      Error.EitherT $ fmap (Error.note $ notFound tokenReq) $
+        liftIO ioGrant
 
     -- Require that the current redirect URL matches the one an authorization
     -- token was granted to.
@@ -284,7 +291,7 @@ requestToken = eitherT jsonError success $ do
     return grantedAccessToken
 
   where
-    success :: AccessToken -> Handler b OAuth ()
+    success :: AccessToken -> Snap.Handler b OAuth ()
     success = writeJSON
 
     notFound tokenReq = Error InvalidGrant
@@ -302,89 +309,90 @@ requestToken = eitherT jsonError success $ do
         "the original authorization grant"
 
     True  `orFail` _ = return ()
-    False `orFail` a = left a
+    False `orFail` a = Error.left a
 
-    jsonError e = modifyResponse (setResponseCode 400) >> writeJSON e
+    jsonError e = Snap.modifyResponse (Snap.setResponseCode 400) >> writeJSON e
 
-    writeJSON :: (ToJSON a, MonadSnap m) => a -> m ()
+    writeJSON :: (ToJSON a, Snap.MonadSnap m) => a -> m ()
     writeJSON j = do
-      modifyResponse $ setContentType "application/json"
-      writeLBS $ encode j
+      Snap.modifyResponse $ Snap.setContentType "application/json"
+      Snap.writeLBS $ encode j
 
 
-withBackend :: (forall o. (OAuthBackend o) => o -> Handler b OAuth a)
-            -> Handler b OAuth a
+withBackend :: (forall o. (OAuthBackend o) => o -> Snap.Handler b OAuth a)
+            -> Snap.Handler b OAuth a
 withBackend a = do (OAuth be _) <- get
                    a be
 
 withBackend' :: (forall o. (OAuthBackend o) => o -> a)
-             -> Handler b OAuth a
+             -> Snap.Handler b OAuth a
 withBackend' a = do (OAuth be _) <- get
                     return $ a be
 
-newCSRFToken :: Handler b OAuth Text
-newCSRFToken = gets oAuthRng >>= liftIO . mkCSRFToken
+newCSRFToken :: Snap.Handler b OAuth Text
+newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
 
 --------------------------------------------------------------------------------
 -- | Initialize the OAuth snaplet, providing handlers to do actual
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
 initInMemoryOAuth :: (AuthorizationRequest
-                  -> Handler b OAuth AuthorizationResult)
+                  -> Snap.Handler b OAuth AuthorizationResult)
                   -- ^ A handler to perform authorization against the server.
-                  -> (Code -> Handler b OAuth ())
+                  -> (Code -> Snap.Handler b OAuth ())
                   -- ^ A handler to display an authorization request 'Code' to
                   -- clients.
-                  -> SnapletInit b OAuth
-initInMemoryOAuth authHandler genericCodeDisplay =
-  makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
-    addRoutes [ ("/auth", authorizationRequest authHandler genericCodeDisplay)
+                  -> Snap.SnapletInit b OAuth
+initInMemoryOAuth authSnap genericCodeDisplay =
+  Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
+    Snap.addRoutes [ ("/auth", authorizationRequest authSnap genericCodeDisplay)
               , ("/token", requestToken)
               ]
-    codeStore <- liftIO $ newMVar Map.empty
-    aliveTokens <- liftIO $ newIORef Set.empty
-    rng <- liftIO mkRNG
+    codeStore <- liftIO $ MVar.newMVar Map.empty
+    aliveTokens <- liftIO $ IORef.newIORef Set.empty
+    rng <- liftIO Snap.mkRNG
     return $ OAuth (InMemoryOAuth codeStore aliveTokens) rng
 
 --------------------------------------------------------------------------------
 -- | Protect a resource by requiring valid OAuth tokens in the request header
 -- before running the body of the handler.
-protect :: Handler b OAuth ()
+protect :: Snap.Handler b OAuth ()
         -- ^ A handler to run if the client is /not/ authorized
-        -> Handler b OAuth ()
+        -> Snap.Handler b OAuth ()
         -- ^ The handler to run on sucessful authentication.
-        -> Handler b OAuth ()
+        -> Snap.Handler b OAuth ()
 protect failure h = do
   authHead <- fmap (take 2 . BS.words) <$>
-                withRequest (return . getHeader "Authorization")
+                Snap.withRequest (return . Snap.getHeader "Authorization")
   case authHead of
     Just ["Bearer", token] -> h
     _ -> failure
 
 --------------------------------------------------------------------------------
-{- Parameter parsers are a combination of 'Reader'/'EitherT' monads. The
-environment is a 'Params' map (from Snap), and 'EitherT' allows us to fail
+{- Parameter parsers are a combination of 'Reader.Reader'/'Error.EitherT' monads. The
+environment is a 'Snap.Params' map (from Snap), and 'Error.EitherT' allows us to fail
 validation at any point. Combinators 'require' and 'optional' take a parameter
 key, and a validation routine.  -}
 
-type ParameterParser a = EitherT Text (Reader Params) a
+type ParameterParser a = Error.EitherT Text (Reader.Reader Snap.Params) a
 
-param :: String -> ParameterParser (Maybe BS.ByteString)
-param p = fmap head . Map.lookup (BS.pack p) <$> lift ask
+param :: String -> Reader.Reader Snap.Params (Maybe BS.ByteString)
+param p = fmap head . Map.lookup (BS.pack p) <$> Reader.ask
 
 require :: String -> (BS.ByteString -> Bool) -> Text
         -> ParameterParser BS.ByteString
 require name predicate e = do
-  v <- param name >>= noteT (Text.append (pack name) " is required") . liftMaybe
-  unless (predicate v) $ left e
+  v <- Error.EitherT $ 
+         Error.note (Text.append (pack name) " is required") <$> param name
+  unless (predicate v) $ Error.left e
   return v
 
 optional :: String -> (BS.ByteString -> Bool) -> Text
          -> ParameterParser (Maybe BS.ByteString)
 optional name predicate e = do
-  v <- param name
+  v <- lift (param name)
   case v of
-    Just v' -> if predicate v' then return v else left e
+    Just v' -> if predicate v' then return v else Error.left e
     Nothing -> return Nothing
 
 parseAuthorizationRequestParameters :: ParameterParser AuthorizationRequest
@@ -411,10 +419,10 @@ redirectUriField = optional "redirect_uri" validRedirectUri
 validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
 validScope _  = True
 
-runParamParser :: MonadSnap m => m Params -> ParameterParser a -> (Text -> e)
-               -> EitherT e m a
+runParamParser :: Snap.MonadSnap m => m Snap.Params -> ParameterParser a -> (Text -> e)
+               -> Error.EitherT e m a
 runParamParser params parser errorFmt = do
   qps <- lift params
-  case runReader (runEitherT parser) qps of
-    Left e -> left (errorFmt e)
-    Right a -> right a
+  case Reader.runReader (Error.runEitherT parser) qps of
+    Left e -> Error.left (errorFmt e)
+    Right a -> Error.right a
