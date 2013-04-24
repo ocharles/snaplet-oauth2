@@ -25,12 +25,12 @@ import Control.Applicative ((<$>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
-import Control.Monad (unless)
-import Data.Aeson (ToJSON(..), encode, (.=), object)
+import Control.Monad ((>=>), mzero, unless)
+import Data.Aeson (ToJSON(..), Value, encode, (.=), object)
 import Data.Maybe (fromMaybe)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text (Text, pack)
-import Data.Time (UTCTime, addUTCTime, getCurrentTime)
+import Data.Time (UTCTime, addUTCTime, getCurrentTime, diffUTCTime)
 import Data.Tuple (swap)
 import Network.URI (isAbsoluteURI, parseAbsoluteURI, uriQuery)
 import Network.URL (importParams, exportParams)
@@ -201,7 +201,7 @@ instance ToJSON ErrorCode where
 data AccessToken = AccessToken
   { accessToken :: Code
   , accessTokenType :: AccessTokenType
-  , accessTokenExpiresIn :: Int
+  , accessTokenExpiresAt :: UTCTime
   , accessTokenRefreshToken :: Code
   , accessTokenClientId :: Text
   } deriving (Eq, Ord)
@@ -213,12 +213,15 @@ data AccessTokenType = Example | Bearer
 
 
 --------------------------------------------------------------------------------
-instance ToJSON AccessToken where
-  toJSON at = object [ "access_token" .= accessToken at
-                     , "token_type" .= show (accessTokenType at)
-                     , "expires_in" .= show (accessTokenExpiresIn at)
-                     , "refresh_token" .= accessTokenRefreshToken at
-                     ]
+accessTokenToJSON :: MonadIO m => AccessToken -> m Value
+accessTokenToJSON at = do
+    now <- liftIO getCurrentTime
+    return $ object
+        [ "access_token" .= accessToken at
+        , "token_type" .= show (accessTokenType at)
+        , "expires_in" .= (floor $ (accessTokenExpiresAt at) `diffUTCTime` now :: Int)
+        , "refresh_token" .= accessTokenRefreshToken at
+        ]
 
 
 --------------------------------------------------------------------------------
@@ -308,10 +311,11 @@ requestToken = Error.eitherT jsonError success $ do
 
     -- All good, grant a new access token!
     token <- lift newCSRFToken
+    now <- liftIO getCurrentTime
     let grantedAccessToken = AccessToken
           { accessToken = token
           , accessTokenType = Bearer
-          , accessTokenExpiresIn = 3600
+          , accessTokenExpiresAt = 3600 `addUTCTime` now
           , accessTokenRefreshToken = token
           , accessTokenClientId = accessTokenReqClientId tokenReq
           }
@@ -322,7 +326,7 @@ requestToken = Error.eitherT jsonError success $ do
 
   where
     success :: AccessToken -> Snap.Handler b OAuth ()
-    success = writeJSON
+    success = accessTokenToJSON >=> writeJSON
 
     notFound tokenReq = Error InvalidGrant
       (Text.append "Authorization request not found: " $
@@ -407,7 +411,12 @@ protect failure h =
             Error.MaybeT $ fmap (take 2 . Text.words . decodeUtf8) <$>
                 Snap.withRequest (return . Snap.getHeader "Authorization")
 
-        Error.MaybeT $ withBackend (\be -> liftIO $ lookupToken be reqToken)
+        token <- Error.MaybeT $ withBackend (\be -> liftIO $ lookupToken be reqToken)
+
+        now <- liftIO getCurrentTime
+        if (now > accessTokenExpiresAt token)
+          then mzero
+          else return ()
 
 
 --------------------------------------------------------------------------------
