@@ -19,6 +19,7 @@ module Snap.Snaplet.OAuth2
     , protect
     ) where
 
+
 --------------------------------------------------------------------------------
 import Control.Applicative ((<$>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -42,7 +43,6 @@ import qualified Control.Monad.Trans.Reader as Reader
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.IORef as IORef
 import qualified Data.Map as Map
-import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Snap.Core as Snap
 import qualified Snap.Snaplet as Snap
@@ -54,31 +54,38 @@ import qualified Snap.Snaplet.Session.Common as Snap
 -- documentation for each method for various invariants that either MUST or
 -- SHOULD be implemented (as defined by RFC-2119).
 class OAuthBackend oauth where
-  -- | Store an access token that has been granted to a client.
-  storeToken :: oauth -> AccessToken -> IO ()
+    -- | Store an access token that has been granted to a client.
+    storeToken :: oauth -> AccessToken -> IO ()
 
-  -- | Store an authorization grant that has been granted to a client.
-  storeAuthorizationGrant :: oauth -> AuthorizationGrant -> IO ()
+    -- | Store an authorization grant that has been granted to a client.
+    storeAuthorizationGrant :: oauth -> AuthorizationGrant -> IO ()
 
-  -- | Retrieve an authorization grant from storage for inspection. This is used
-  -- to verify an authorization grant for its validaty against subsequent client
-  -- requests.
-  --
-  -- This function should remove the authorization grant from storage entirely
-  -- so that subsequent calls to 'inspectAuthorizationGrant' with the same
-  -- parameters return 'Nothing'.
-  inspectAuthorizationGrant :: oauth -> Code -> IO (Maybe AuthorizationGrant)
+    -- | Retrieve an authorization grant from storage for inspection. This is
+    -- used to verify an authorization grant for its validaty against subsequent
+    -- client requests.
+    --
+    -- This function should remove the authorization grant from storage entirely
+    -- so that subsequent calls to 'inspectAuthorizationGrant' with the same
+    -- parameters return 'Nothing'.
+    inspectAuthorizationGrant :: oauth -> Code -> IO (Maybe AuthorizationGrant)
+
+    -- | Attempt to lookup an access token.
+    lookupToken :: oauth -> Code -> IO (Maybe AccessToken)
+
 
 --------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
 type Code = Text
 
+
 --------------------------------------------------------------------------------
 data InMemoryOAuth = InMemoryOAuth
   { oAuthGranted :: MVar.MVar (Map.Map Code AuthorizationGrant)
-  , oAuthAliveTokens :: IORef.IORef (Set.Set AccessToken)
+  , oAuthAliveTokens :: IORef.IORef (Map.Map Code AccessToken)
   }
 
+
+--------------------------------------------------------------------------------
 instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
     MVar.modifyMVar_ (oAuthGranted be) $
@@ -89,21 +96,25 @@ instance OAuthBackend InMemoryOAuth where
       return . (swap . Map.updateLookupWithKey (const (const Nothing)) code)
 
   storeToken be token =
-    IORef.modifyIORef (oAuthAliveTokens be) (Set.insert token)
+    IORef.modifyIORef (oAuthAliveTokens be) (Map.insert (accessToken token) token)
 
-{-| The OAuth snaplet. You should nest this inside your application snaplet
-using 'nestSnaplet' with the 'initInMemoryOAuth' initializer. -}
+  lookupToken be token =
+    Map.lookup token <$> IORef.readIORef (oAuthAliveTokens be)
+
+--------------------------------------------------------------------------------
+-- | The OAuth snaplet. You should nest this inside your application snaplet
+-- using 'nestSnaplet' with the 'initInMemoryOAuth' initializer.
 data OAuth = forall o. OAuthBackend o => OAuth
   { oAuthBackend :: o
   , oAuthRng :: Snap.RNG
   }
 
 --------------------------------------------------------------------------------
-{-| The result of an authorization request. -}
+-- | The result of an authorization request.
 data AuthorizationResult =
-    {-| The resource owner is in the process of granting authorization. There
-may be multiple page requests to grant authorization (ie, the user accidently
-types invalid input, or uses multifactor authentication). -}
+    -- | The resource owner is in the process of granting authorization. There
+    -- may be multiple page requests to grant authorization (ie, the user
+    -- accidently types invalid input, or uses multifactor authentication).
     InProgress
 
     -- | The request was not approved.
@@ -112,24 +123,26 @@ types invalid input, or uses multifactor authentication). -}
     -- | The resource owner has granted permission.
   | Granted
 
+
 --------------------------------------------------------------------------------
 -- | Information about an authorization request from a client.
 data AuthorizationRequest = AuthorizationRequest
   { -- | The client's unique identifier.
     authReqClientId :: Text
 
-    {-| The (optional) redirection URI to redirect to on success. The OAuth
-snaplet will take care of this redirection; you do not need to perform the
-redirection yourself. -}
+    -- | The (optional) redirection URI to redirect to on success. The OAuth
+    -- snaplet will take care of this redirection; you do not need to perform the
+    -- redirection yourself.
   , authReqRedirectUri :: Maybe BS.ByteString
 
     -- | The scope of authorization requested.
   , authReqScope :: Maybe Text
 
-    {-| Any state the client wishes to be associated with the authorization
-request. -}
+    -- | Any state the client wishes to be associated with the authorization
+    -- request.
   , authReqState :: Maybe Text
   }
+
 
 --------------------------------------------------------------------------------
 data AuthorizationGrant = AuthorizationGrant
@@ -139,6 +152,7 @@ data AuthorizationGrant = AuthorizationGrant
   , authGrantClientId :: Text
   }
 
+
 --------------------------------------------------------------------------------
 data AccessTokenRequest = AccessTokenRequest
   { accessTokenReqCode :: Code
@@ -146,15 +160,20 @@ data AccessTokenRequest = AccessTokenRequest
   , accessTokenReqClientId :: Text
   }
 
+
 --------------------------------------------------------------------------------
 data Error = Error { errorCode :: ErrorCode
                    , errorBody :: Text
                    }
 
+
+--------------------------------------------------------------------------------
 data ErrorCode = InvalidRequest | InvalidClient | InvalidGrant
                | UnauthorizedClient | UnsupportedGrantType
                | InvalidScope | AccessDenied
 
+
+--------------------------------------------------------------------------------
 instance Show ErrorCode where
   show c = case c of
     InvalidRequest -> "invalid_request"
@@ -165,13 +184,18 @@ instance Show ErrorCode where
     InvalidScope -> "invalid_scope"
     AccessDenied -> "access_denied"
 
+
+--------------------------------------------------------------------------------
 instance ToJSON Error where
   toJSON (Error code body) = object [ "error" .= code
                                     , "error_description" .= body
                                     ]
 
+
+--------------------------------------------------------------------------------
 instance ToJSON ErrorCode where
   toJSON = toJSON . show
+
 
 --------------------------------------------------------------------------------
 data AccessToken = AccessToken
@@ -182,15 +206,20 @@ data AccessToken = AccessToken
   , accessTokenClientId :: Text
   } deriving (Eq, Ord)
 
+
+--------------------------------------------------------------------------------
 data AccessTokenType = Example | Bearer
   deriving (Eq, Ord, Show)
 
+
+--------------------------------------------------------------------------------
 instance ToJSON AccessToken where
   toJSON at = object [ "access_token" .= accessToken at
                      , "token_type" .= show (accessTokenType at)
                      , "expires_in" .= show (accessTokenExpiresIn at)
                      , "refresh_token" .= accessTokenRefreshToken at
                      ]
+
 
 --------------------------------------------------------------------------------
 authorizationRequest :: (AuthorizationRequest -> Snap.Handler b OAuth AuthorizationResult)
@@ -241,12 +270,13 @@ authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ 
         Denied     -> Error.left $ redirectError authReq $ Error AccessDenied
                         "The resource owner has denied this request"
 
-    redirectError authReq error = do
+    redirectError authReq oAuthError = do
       case authReqRedirectUri authReq of
         Just uri -> augmentedRedirect uri
-                      [ ("error", show $ errorCode error)
-                      , ("error_description", Text.unpack $ errorBody error)
+                      [ ("error", show $ errorCode oAuthError)
+                      , ("error_description", Text.unpack $ errorBody oAuthError)
                       ]
+
 
 --------------------------------------------------------------------------------
 requestToken :: Snap.Handler b OAuth ()
@@ -319,18 +349,24 @@ requestToken = Error.eitherT jsonError success $ do
       Snap.writeLBS $ encode j
 
 
+--------------------------------------------------------------------------------
 withBackend :: (forall o. (OAuthBackend o) => o -> Snap.Handler b OAuth a)
             -> Snap.Handler b OAuth a
 withBackend a = do (OAuth be _) <- get
                    a be
 
+
+--------------------------------------------------------------------------------
 withBackend' :: (forall o. (OAuthBackend o) => o -> a)
              -> Snap.Handler b OAuth a
 withBackend' a = do (OAuth be _) <- get
                     return $ a be
 
+
+--------------------------------------------------------------------------------
 newCSRFToken :: Snap.Handler b OAuth Text
 newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
+
 
 --------------------------------------------------------------------------------
 -- | Initialize the OAuth snaplet, providing handlers to do actual
@@ -345,13 +381,17 @@ initInMemoryOAuth :: (AuthorizationRequest
                   -> Snap.SnapletInit b OAuth
 initInMemoryOAuth authSnap genericCodeDisplay =
   Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
-    Snap.addRoutes [ ("/auth", authorizationRequest authSnap genericCodeDisplay)
-              , ("/token", requestToken)
-              ]
+    Snap.addRoutes
+      [ ("/auth", authorizationRequest authSnap genericCodeDisplay)
+      , ("/token", requestToken)
+      ]
+
     codeStore <- liftIO $ MVar.newMVar Map.empty
-    aliveTokens <- liftIO $ IORef.newIORef Set.empty
+    aliveTokens <- liftIO $ IORef.newIORef Map.empty
     rng <- liftIO Snap.mkRNG
+
     return $ OAuth (InMemoryOAuth codeStore aliveTokens) rng
+
 
 --------------------------------------------------------------------------------
 -- | Protect a resource by requiring valid OAuth tokens in the request header
@@ -361,32 +401,39 @@ protect :: Snap.Handler b OAuth ()
         -> Snap.Handler b OAuth ()
         -- ^ The handler to run on sucessful authentication.
         -> Snap.Handler b OAuth ()
-protect failure h = do
-  authHead <- fmap (take 2 . BS.words) <$>
+protect failure h =
+    Error.maybeT failure (const h) $ do
+        ["Bearer", reqToken] <-
+            Error.MaybeT $ fmap (take 2 . Text.words . decodeUtf8) <$>
                 Snap.withRequest (return . Snap.getHeader "Authorization")
-  case authHead of
-    Just ["Bearer", token] -> h
-    _ -> failure
+
+        Error.MaybeT $ withBackend (\be -> liftIO $ lookupToken be reqToken)
+
 
 --------------------------------------------------------------------------------
-{- Parameter parsers are a combination of 'Reader.Reader'/'Error.EitherT' monads. The
-environment is a 'Snap.Params' map (from Snap), and 'Error.EitherT' allows us to fail
-validation at any point. Combinators 'require' and 'optional' take a parameter
-key, and a validation routine.  -}
-
+-- | Parameter parsers are a combination of 'Reader.Reader'/'Error.EitherT'
+-- monads. The environment is a 'Snap.Params' map (from Snap), and
+-- 'Error.EitherT' allows us to fail validation at any point. Combinators
+-- 'require' and 'optional' take a parameter key, and a validation routine.
 type ParameterParser a = Error.EitherT Text (Reader.Reader Snap.Params) a
 
+
+--------------------------------------------------------------------------------
 param :: String -> Reader.Reader Snap.Params (Maybe BS.ByteString)
 param p = fmap head . Map.lookup (BS.pack p) <$> Reader.ask
 
+
+--------------------------------------------------------------------------------
 require :: String -> (BS.ByteString -> Bool) -> Text
         -> ParameterParser BS.ByteString
 require name predicate e = do
-  v <- Error.EitherT $ 
+  v <- Error.EitherT $
          Error.note (Text.append (pack name) " is required") <$> param name
   unless (predicate v) $ Error.left e
   return v
 
+
+--------------------------------------------------------------------------------
 optional :: String -> (BS.ByteString -> Bool) -> Text
          -> ParameterParser (Maybe BS.ByteString)
 optional name predicate e = do
@@ -395,6 +442,8 @@ optional name predicate e = do
     Just v' -> if predicate v' then return v else Error.left e
     Nothing -> return Nothing
 
+
+--------------------------------------------------------------------------------
 parseAuthorizationRequestParameters :: ParameterParser AuthorizationRequest
 parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
@@ -403,6 +452,8 @@ parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*> fmap (fmap decodeUtf8) (optional "scope" validScope "")
   <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
 
+
+--------------------------------------------------------------------------------
 parseTokenRequestParameters :: ParameterParser AccessTokenRequest
 parseTokenRequestParameters = pure AccessTokenRequest
   <*  require "grant_type" (== "authorization_code")
@@ -411,14 +462,30 @@ parseTokenRequestParameters = pure AccessTokenRequest
   <*> redirectUriField
   <*> clientIdField
 
+
+--------------------------------------------------------------------------------
+clientIdField :: ParameterParser Text
 clientIdField = fmap decodeUtf8 (require "client_id" (const True) "")
+
+
+--------------------------------------------------------------------------------
+redirectUriField :: ParameterParser (Maybe BS.ByteString)
 redirectUriField = optional "redirect_uri" validRedirectUri
   (Text.append "redirect_uri must be an absolute URI and not contain a "
                "fragment component")
 
+
+--------------------------------------------------------------------------------
+validRedirectUri :: BS.ByteString -> Bool
 validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
+
+
+--------------------------------------------------------------------------------
+validScope :: BS.ByteString -> Bool
 validScope _  = True
 
+
+--------------------------------------------------------------------------------
 runParamParser :: Snap.MonadSnap m => m Snap.Params -> ParameterParser a -> (Text -> e)
                -> Error.EitherT e m a
 runParamParser params parser errorFmt = do

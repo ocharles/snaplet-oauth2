@@ -5,7 +5,7 @@ module Main where
 import Prelude hiding (unlines)
 
 import Control.Applicative
-import Data.Lens.Template
+import Control.Lens.TH
 import Data.Text
 import Data.Text.Encoding (decodeUtf8)
 import Snap.Blaze
@@ -20,7 +20,7 @@ import qualified Text.Blaze.Html5.Attributes as A
 
 -- First we define our application as normal, nesting a 'OAuth' 'Snaplet'.
 data App = App { _oAuth :: Snaplet OAuth }
-makeLenses [''App]
+makeLenses ''App
 
 -- This handler will normally display a login form, and require users to
 -- login to the website and then grant access to a client. In this example
