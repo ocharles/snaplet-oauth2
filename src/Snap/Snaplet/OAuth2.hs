@@ -406,7 +406,7 @@ protect :: Snap.Handler b OAuth ()
         -- ^ The handler to run on sucessful authentication.
         -> Snap.Handler b OAuth ()
 protect failure h =
-    Error.maybeT failure (const h) $ do
+    Error.maybeT (wwwAuthenticate >> failure) (const h) $ do
         reqToken <-     authorizationRequestHeader
                     <|> postParameter
                     <|> queryParameter
@@ -420,6 +420,11 @@ protect failure h =
           else return ()
 
   where
+
+    wwwAuthenticate = do
+        Snap.modifyResponse $
+          Snap.setResponseCode 401 .
+          Snap.setHeader "WWW-Authenticate" "Bearer"
 
     authorizationRequestHeader = do
         ["Bearer", reqToken] <-

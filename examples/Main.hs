@@ -55,8 +55,7 @@ showCode = writeText
 protected :: Handler App App ()
 protected = with oAuth $ protect deny $ do
   writeText "Congragulationing! This resource is protected"
-  where deny = do writeText "Denied"
-                  modifyResponse (setResponseCode 500)
+  where deny = writeText "Denied"
 
 -- A simple initializer for our application
 appInit :: SnapletInit App App
