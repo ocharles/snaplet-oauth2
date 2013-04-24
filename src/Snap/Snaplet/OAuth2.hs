@@ -21,7 +21,7 @@ module Snap.Snaplet.OAuth2
 
 
 --------------------------------------------------------------------------------
-import Control.Applicative ((<$>), (<*>), (<*), pure)
+import Control.Applicative ((<$>), (<|>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
@@ -407,17 +407,31 @@ protect :: Snap.Handler b OAuth ()
         -> Snap.Handler b OAuth ()
 protect failure h =
     Error.maybeT failure (const h) $ do
-        ["Bearer", reqToken] <-
-            Error.MaybeT $ fmap (take 2 . Text.words . decodeUtf8) <$>
-                Snap.withRequest (return . Snap.getHeader "Authorization")
+        reqToken <-     authorizationRequestHeader
+                    <|> postParameter
+                    <|> queryParameter
 
-        token <- Error.MaybeT $ withBackend (\be -> liftIO $ lookupToken be reqToken)
+        token <- Error.MaybeT $ withBackend $
+            \be -> liftIO $ lookupToken be reqToken
 
         now <- liftIO getCurrentTime
         if (now > accessTokenExpiresAt token)
           then mzero
           else return ()
 
+  where
+
+    authorizationRequestHeader = do
+        ["Bearer", reqToken] <-
+            Error.MaybeT $ fmap (take 2 . Text.words . decodeUtf8) <$>
+                Snap.withRequest (return . Snap.getHeader "Authorization")
+        return reqToken
+
+    postParameter =
+        decodeUtf8 <$> Error.MaybeT (Snap.getPostParam "access_token")
+
+    queryParameter =
+        decodeUtf8 <$> Error.MaybeT (Snap.getQueryParam "access_token")
 
 --------------------------------------------------------------------------------
 -- | Parameter parsers are a combination of 'Reader.Reader'/'Error.EitherT'

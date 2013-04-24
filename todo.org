@@ -26,3 +26,8 @@
 ** TODO Unit tests!
 ** TODO PostgreSQL backend
 ** TODO Various warnings (failed pattern matches, etc)
+
+
+Bearer auth:
+
+- Much more validation on when to allow post/get
