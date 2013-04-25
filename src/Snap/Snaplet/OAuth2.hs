@@ -52,6 +52,8 @@ import qualified Snap.Core as Snap
 import qualified Snap.Snaplet as Snap
 import qualified Snap.Snaplet.Session.Common as Snap
 
+import qualified Snap.Snaplet.OAuth2.AccessToken as AccessToken
+import qualified Snap.Snaplet.OAuth2.AuthorizationGrant as AuthorizationGrant
 
 --------------------------------------------------------------------------------
 -- | All storage backends for OAuth must implement the following API. See the
@@ -78,17 +80,27 @@ class OAuthBackend oauth where
 
 
 --------------------------------------------------------------------------------
+data Error e = Error
+  { errorCode :: e
+  , errorBody :: Text
+  }
+
+--------------------------------------------------------------------------------
+instance ToJSON e => ToJSON (Error e) where
+  toJSON (Error code body) = object [ "error" .= code
+                                    , "error_description" .= body
+                                    ]
+
+
+--------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
 type Code = Text
 
 
 --------------------------------------------------------------------------------
-
---------------------------------------------------------------------------------
 data InMemoryOAuth scope = InMemoryOAuth
   { oAuthGranted :: MVar.MVar (Map.Map Code (AuthorizationGrant scope))
   , oAuthAliveTokens :: IORef.IORef (Map.Map Code (AccessToken scope))
-  , oAuthClients :: IORef.IORef (Map.Map ClientId Client)
   }
 
 
@@ -167,42 +179,6 @@ data AccessTokenRequest = AccessTokenRequest
   , accessTokenReqRedirect :: Maybe BS.ByteString
   , accessTokenReqClientId :: Text
   }
-
-
---------------------------------------------------------------------------------
-data Error = Error { errorCode :: ErrorCode
-                   , errorBody :: Text
-                   }
-
-
---------------------------------------------------------------------------------
-data ErrorCode = InvalidRequest | InvalidClient | InvalidGrant
-               | UnauthorizedClient | UnsupportedGrantType
-               | InvalidScope | AccessDenied
-
-
---------------------------------------------------------------------------------
-instance Show ErrorCode where
-  show c = case c of
-    InvalidRequest -> "invalid_request"
-    InvalidClient -> "invalid_client"
-    InvalidGrant -> "invalid_grant"
-    UnauthorizedClient -> "unauthorized_client"
-    UnsupportedGrantType -> "unsupported_grant_type"
-    InvalidScope -> "invalid_scope"
-    AccessDenied -> "access_denied"
-
-
---------------------------------------------------------------------------------
-instance ToJSON Error where
-  toJSON (Error code body) = object [ "error" .= code
-                                    , "error_description" .= body
-                                    ]
-
-
---------------------------------------------------------------------------------
-instance ToJSON ErrorCode where
-  toJSON = toJSON . show
 
 
 --------------------------------------------------------------------------------
@@ -291,8 +267,10 @@ authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ 
       case authResult of
         Granted    -> Error.right ()
         InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
-        Denied     -> Error.left $ redirectError authReq $ Error AccessDenied
-                        "The resource owner has denied this request"
+        Denied     -> Error.left $ redirectError authReq $
+                        Error
+                          AccessToken.AccessDenied
+                          "The resource owner has denied this request"
 
     redirectError authReq oAuthError = do
       case authReqRedirectUri authReq of
@@ -307,7 +285,7 @@ requestToken :: Snap.Handler b (OAuth scope) ()
 requestToken = Error.eitherT jsonError success $ do
     -- Parse the request into a AccessTokenRequest.
     tokenReq <- runParamParser Snap.getPostParams parseTokenRequestParameters
-                  (Error InvalidRequest)
+                  (Error AccessToken.InvalidRequest)
 
     -- Find the authorization grant, failing if it can't be found.
     -- Error.EitherT $ (fmap.fmap) (Error.note (notFound tokenReq)) $
@@ -349,17 +327,17 @@ requestToken = Error.eitherT jsonError success $ do
   where
     success = accessTokenToJSON >=> writeJSON
 
-    notFound tokenReq = Error InvalidGrant
+    notFound tokenReq = Error AccessToken.InvalidGrant
       (Text.append "Authorization request not found: " $
          accessTokenReqCode tokenReq)
 
-    expired = Error InvalidGrant
+    expired = Error AccessToken.InvalidGrant
       "This authorization grant has expired"
 
-    mismatchedClient = Error InvalidGrant
+    mismatchedClient = Error AccessToken.InvalidGrant
       "This authorization token was issued to another client"
 
-    mismatchedClientRedirect = Error InvalidGrant $
+    mismatchedClientRedirect = Error AccessToken.InvalidGrant $
       Text.append "The redirection URL does not match the redirection URL in "
         "the original authorization grant"
 
@@ -466,7 +444,7 @@ protect scope failure h =
 -- monads. The environment is a 'Snap.Params' map (from Snap), and
 -- 'Error.EitherT' allows us to fail validation at any point. Combinators
 -- 'require' and 'optional' take a parameter key, and a validation routine.
-type ParameterParser a = Error.EitherT Text (Reader.Reader Snap.Params) a
+type ParameterParser e a = Error.EitherT e (Reader.Reader Snap.Params) a
 
 
 --------------------------------------------------------------------------------
@@ -476,7 +454,7 @@ param p = fmap head . Map.lookup (encodeUtf8 . Text.pack $ p) <$> Reader.ask
 
 --------------------------------------------------------------------------------
 require :: String -> (BS.ByteString -> Bool) -> Text
-        -> ParameterParser BS.ByteString
+        -> ParameterParser Text BS.ByteString
 require name predicate e = do
   v <- Error.EitherT $
          Error.note (Text.append (pack name) " is required") <$> param name
@@ -486,7 +464,7 @@ require name predicate e = do
 
 --------------------------------------------------------------------------------
 optional :: String -> (BS.ByteString -> Bool) -> Text
-         -> ParameterParser (Maybe BS.ByteString)
+         -> ParameterParser Text (Maybe BS.ByteString)
 optional name predicate e = do
   v <- lift (param name)
   case v of
@@ -495,7 +473,7 @@ optional name predicate e = do
 
 
 --------------------------------------------------------------------------------
-parseAuthorizationRequestParameters :: Scope scope => ParameterParser (AuthorizationRequest scope)
+parseAuthorizationRequestParameters :: Scope scope => ParameterParser Text (AuthorizationRequest scope)
 parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
   <*> clientIdField
@@ -522,7 +500,7 @@ parseAuthorizationRequestParameters = pure AuthorizationRequest
             else return (Set.fromList $ Error.catMaybes parsed)
 
 --------------------------------------------------------------------------------
-parseTokenRequestParameters :: ParameterParser AccessTokenRequest
+parseTokenRequestParameters :: ParameterParser Text AccessTokenRequest
 parseTokenRequestParameters = pure AccessTokenRequest
   <*  require "grant_type" (== "authorization_code")
         "grant_type must be authorization_code"
@@ -532,12 +510,12 @@ parseTokenRequestParameters = pure AccessTokenRequest
 
 
 --------------------------------------------------------------------------------
-clientIdField :: ParameterParser Text
+clientIdField :: ParameterParser Text Text
 clientIdField = fmap decodeUtf8 (require "client_id" (const True) "")
 
 
 --------------------------------------------------------------------------------
-redirectUriField :: ParameterParser (Maybe BS.ByteString)
+redirectUriField :: ParameterParser Text (Maybe BS.ByteString)
 redirectUriField = optional "redirect_uri" validRedirectUri
   (Text.append "redirect_uri must be an absolute URI and not contain a "
                "fragment component")
@@ -549,8 +527,8 @@ validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
 
 
 --------------------------------------------------------------------------------
-runParamParser :: Snap.MonadSnap m => m Snap.Params -> ParameterParser a -> (Text -> e)
-               -> Error.EitherT e m a
+runParamParser :: Snap.MonadSnap m => m Snap.Params -> ParameterParser e a -> (e -> e')
+               -> Error.EitherT e' m a
 runParamParser params parser errorFmt = do
   qps <- lift params
   case Reader.runReader (Error.runEitherT parser) qps of
