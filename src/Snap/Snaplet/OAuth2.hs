@@ -6,7 +6,7 @@ module Snap.Snaplet.OAuth2
       OAuth
     , initInMemoryOAuth
 
-      -- * Authorization Snap.Handlers
+      -- * Authorization 'Snap.Handler's
     , AuthorizationResult(..)
     , AuthorizationRequest
     , Code
@@ -14,6 +14,9 @@ module Snap.Snaplet.OAuth2
     , authReqRedirectUri
     , authReqScope
     , authReqState
+
+      -- * Scope
+    , Scope(..)
 
       -- * Defining Protected Resources
     , protect
@@ -25,7 +28,7 @@ import Control.Applicative ((<$>), (<|>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
-import Control.Monad ((>=>), mzero, unless)
+import Control.Monad ((>=>), guard, unless)
 import Data.Aeson (ToJSON(..), Value, encode, (.=), object)
 import Data.Maybe (fromMaybe)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -40,10 +43,11 @@ import Network.URL (importParams, exportParams)
 import qualified Control.Concurrent.MVar as MVar
 import qualified Control.Error as Error
 import qualified Control.Monad.Trans.Reader as Reader
-import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString as BS
 import qualified Data.IORef as IORef
 import qualified Data.Map as Map
 import qualified Data.Text as Text
+import qualified Data.Set as Set
 import qualified Snap.Core as Snap
 import qualified Snap.Snaplet as Snap
 import qualified Snap.Snaplet.Session.Common as Snap
@@ -55,10 +59,10 @@ import qualified Snap.Snaplet.Session.Common as Snap
 -- SHOULD be implemented (as defined by RFC-2119).
 class OAuthBackend oauth where
     -- | Store an access token that has been granted to a client.
-    storeToken :: oauth -> AccessToken -> IO ()
+    storeToken :: oauth scope -> (AccessToken scope) -> IO ()
 
     -- | Store an authorization grant that has been granted to a client.
-    storeAuthorizationGrant :: oauth -> AuthorizationGrant -> IO ()
+    storeAuthorizationGrant :: oauth scope -> AuthorizationGrant scope -> IO ()
 
     -- | Retrieve an authorization grant from storage for inspection. This is
     -- used to verify an authorization grant for its validaty against subsequent
@@ -67,10 +71,10 @@ class OAuthBackend oauth where
     -- This function should remove the authorization grant from storage entirely
     -- so that subsequent calls to 'inspectAuthorizationGrant' with the same
     -- parameters return 'Nothing'.
-    inspectAuthorizationGrant :: oauth -> Code -> IO (Maybe AuthorizationGrant)
+    inspectAuthorizationGrant :: oauth scope -> Code -> IO (Maybe (AuthorizationGrant scope))
 
     -- | Attempt to lookup an access token.
-    lookupToken :: oauth -> Code -> IO (Maybe AccessToken)
+    lookupToken :: oauth scope -> Code -> IO (Maybe (AccessToken scope))
 
 
 --------------------------------------------------------------------------------
@@ -79,9 +83,12 @@ type Code = Text
 
 
 --------------------------------------------------------------------------------
-data InMemoryOAuth = InMemoryOAuth
-  { oAuthGranted :: MVar.MVar (Map.Map Code AuthorizationGrant)
-  , oAuthAliveTokens :: IORef.IORef (Map.Map Code AccessToken)
+
+--------------------------------------------------------------------------------
+data InMemoryOAuth scope = InMemoryOAuth
+  { oAuthGranted :: MVar.MVar (Map.Map Code (AuthorizationGrant scope))
+  , oAuthAliveTokens :: IORef.IORef (Map.Map Code (AccessToken scope))
+  , oAuthClients :: IORef.IORef (Map.Map ClientId Client)
   }
 
 
@@ -104,8 +111,8 @@ instance OAuthBackend InMemoryOAuth where
 --------------------------------------------------------------------------------
 -- | The OAuth snaplet. You should nest this inside your application snaplet
 -- using 'nestSnaplet' with the 'initInMemoryOAuth' initializer.
-data OAuth = forall o. OAuthBackend o => OAuth
-  { oAuthBackend :: o
+data OAuth scope = forall o. OAuthBackend o => OAuth
+  { oAuthBackend :: o scope
   , oAuthRng :: Snap.RNG
   }
 
@@ -126,7 +133,7 @@ data AuthorizationResult =
 
 --------------------------------------------------------------------------------
 -- | Information about an authorization request from a client.
-data AuthorizationRequest = AuthorizationRequest
+data AuthorizationRequest scope = AuthorizationRequest
   { -- | The client's unique identifier.
     authReqClientId :: Text
 
@@ -136,7 +143,7 @@ data AuthorizationRequest = AuthorizationRequest
   , authReqRedirectUri :: Maybe BS.ByteString
 
     -- | The scope of authorization requested.
-  , authReqScope :: Maybe Text
+  , authReqScope :: Set.Set scope
 
     -- | Any state the client wishes to be associated with the authorization
     -- request.
@@ -145,11 +152,12 @@ data AuthorizationRequest = AuthorizationRequest
 
 
 --------------------------------------------------------------------------------
-data AuthorizationGrant = AuthorizationGrant
+data AuthorizationGrant scope = AuthorizationGrant
   { authGrantCode :: Code
   , authGrantExpiresAt :: UTCTime
   , authGrantRedirectUri :: Maybe BS.ByteString
   , authGrantClientId :: Text
+  , authGrantScope :: Set.Set scope
   }
 
 
@@ -198,12 +206,13 @@ instance ToJSON ErrorCode where
 
 
 --------------------------------------------------------------------------------
-data AccessToken = AccessToken
+data AccessToken scope = AccessToken
   { accessToken :: Code
   , accessTokenType :: AccessTokenType
   , accessTokenExpiresAt :: UTCTime
   , accessTokenRefreshToken :: Code
   , accessTokenClientId :: Text
+  , accessTokenScope :: Set.Set scope
   } deriving (Eq, Ord)
 
 
@@ -213,7 +222,17 @@ data AccessTokenType = Example | Bearer
 
 
 --------------------------------------------------------------------------------
-accessTokenToJSON :: MonadIO m => AccessToken -> m Value
+class Ord a => Scope a where
+    parseScope :: Text -> Maybe a
+
+    showScope :: a -> Text
+
+    defaultScope :: Maybe [a]
+    defaultScope = Nothing
+
+
+--------------------------------------------------------------------------------
+accessTokenToJSON :: MonadIO m => (AccessToken scope) -> m Value
 accessTokenToJSON at = do
     now <- liftIO getCurrentTime
     return $ object
@@ -225,9 +244,10 @@ accessTokenToJSON at = do
 
 
 --------------------------------------------------------------------------------
-authorizationRequest :: (AuthorizationRequest -> Snap.Handler b OAuth AuthorizationResult)
-                     -> (Code -> Snap.Handler b OAuth ())
-                     -> Snap.Handler b OAuth ()
+authorizationRequest :: Scope scope
+                     => ([scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
+                     -> (Code -> Snap.Handler b (OAuth scope) ())
+                     -> Snap.Handler b (OAuth scope) ()
 authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ do
     -- Parse the request for validity.
     authReq <- runParamParser Snap.getQueryParams parseAuthorizationRequestParameters
@@ -244,6 +264,7 @@ authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ 
           , authGrantExpiresAt = addUTCTime 600 now
           , authGrantRedirectUri = authReqRedirectUri authReq
           , authGrantClientId = authReqClientId authReq
+          , authGrantScope = authReqScope authReq
           }
     lift (withBackend' $ \be -> storeAuthorizationGrant be authGrant) >>= liftIO
 
@@ -266,7 +287,7 @@ authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ 
                         params }
 
     verifyWithResourceOwner authReq = do
-      authResult <- lift $ authSnap authReq
+      authResult <- lift $ authSnap (Set.toList $ authReqScope authReq)
       case authResult of
         Granted    -> Error.right ()
         InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
@@ -282,7 +303,7 @@ authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ 
 
 
 --------------------------------------------------------------------------------
-requestToken :: Snap.Handler b OAuth ()
+requestToken :: Snap.Handler b (OAuth scope) ()
 requestToken = Error.eitherT jsonError success $ do
     -- Parse the request into a AccessTokenRequest.
     tokenReq <- runParamParser Snap.getPostParams parseTokenRequestParameters
@@ -318,6 +339,7 @@ requestToken = Error.eitherT jsonError success $ do
           , accessTokenExpiresAt = 3600 `addUTCTime` now
           , accessTokenRefreshToken = token
           , accessTokenClientId = accessTokenReqClientId tokenReq
+          , accessTokenScope = authGrantScope grant
           }
 
     -- Store the granted access token, handling backend failure.
@@ -325,7 +347,6 @@ requestToken = Error.eitherT jsonError success $ do
     return grantedAccessToken
 
   where
-    success :: AccessToken -> Snap.Handler b OAuth ()
     success = accessTokenToJSON >=> writeJSON
 
     notFound tokenReq = Error InvalidGrant
@@ -354,21 +375,21 @@ requestToken = Error.eitherT jsonError success $ do
 
 
 --------------------------------------------------------------------------------
-withBackend :: (forall o. (OAuthBackend o) => o -> Snap.Handler b OAuth a)
-            -> Snap.Handler b OAuth a
+withBackend :: (forall o. (OAuthBackend o) => o scope -> Snap.Handler b (OAuth scope) a)
+            -> Snap.Handler b (OAuth scope) a
 withBackend a = do (OAuth be _) <- get
                    a be
 
 
 --------------------------------------------------------------------------------
-withBackend' :: (forall o. (OAuthBackend o) => o -> a)
-             -> Snap.Handler b OAuth a
+withBackend' :: (forall o. (OAuthBackend o) => o scope -> a)
+             -> Snap.Handler b (OAuth scope) a
 withBackend' a = do (OAuth be _) <- get
                     return $ a be
 
 
 --------------------------------------------------------------------------------
-newCSRFToken :: Snap.Handler b OAuth Text
+newCSRFToken :: Snap.Handler b (OAuth scope) Text
 newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
 
 
@@ -376,13 +397,13 @@ newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
 -- | Initialize the OAuth snaplet, providing handlers to do actual
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
-initInMemoryOAuth :: (AuthorizationRequest
-                  -> Snap.Handler b OAuth AuthorizationResult)
+initInMemoryOAuth :: Scope scope
+                  =>([scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
                   -- ^ A handler to perform authorization against the server.
-                  -> (Code -> Snap.Handler b OAuth ())
+                  -> (Code -> Snap.Handler b (OAuth scope) ())
                   -- ^ A handler to display an authorization request 'Code' to
                   -- clients.
-                  -> Snap.SnapletInit b OAuth
+                  -> Snap.SnapletInit b (OAuth scope)
 initInMemoryOAuth authSnap genericCodeDisplay =
   Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
     Snap.addRoutes
@@ -400,12 +421,15 @@ initInMemoryOAuth authSnap genericCodeDisplay =
 --------------------------------------------------------------------------------
 -- | Protect a resource by requiring valid OAuth tokens in the request header
 -- before running the body of the handler.
-protect :: Snap.Handler b OAuth ()
+protect :: Scope scope
+        => [scope]
+        -- ^ The scope that a client must have
+        -> Snap.Handler b (OAuth scope) ()
         -- ^ A handler to run if the client is /not/ authorized
-        -> Snap.Handler b OAuth ()
+        -> Snap.Handler b (OAuth scope) ()
         -- ^ The handler to run on sucessful authentication.
-        -> Snap.Handler b OAuth ()
-protect failure h =
+        -> Snap.Handler b (OAuth scope) ()
+protect scope failure h =
     Error.maybeT (wwwAuthenticate >> failure) (const h) $ do
         reqToken <-     authorizationRequestHeader
                     <|> postParameter
@@ -415,9 +439,8 @@ protect failure h =
             \be -> liftIO $ lookupToken be reqToken
 
         now <- liftIO getCurrentTime
-        if (now > accessTokenExpiresAt token)
-          then mzero
-          else return ()
+        guard (now < accessTokenExpiresAt token)
+        guard (Set.fromList scope `Set.isSubsetOf` accessTokenScope token)
 
   where
 
@@ -448,7 +471,7 @@ type ParameterParser a = Error.EitherT Text (Reader.Reader Snap.Params) a
 
 --------------------------------------------------------------------------------
 param :: String -> Reader.Reader Snap.Params (Maybe BS.ByteString)
-param p = fmap head . Map.lookup (BS.pack p) <$> Reader.ask
+param p = fmap head . Map.lookup (encodeUtf8 . Text.pack $ p) <$> Reader.ask
 
 
 --------------------------------------------------------------------------------
@@ -472,14 +495,31 @@ optional name predicate e = do
 
 
 --------------------------------------------------------------------------------
-parseAuthorizationRequestParameters :: ParameterParser AuthorizationRequest
+parseAuthorizationRequestParameters :: Scope scope => ParameterParser (AuthorizationRequest scope)
 parseAuthorizationRequestParameters = pure AuthorizationRequest
   <*  require "response_type" (== "code") "response_type must be code"
   <*> clientIdField
   <*> redirectUriField
-  <*> fmap (fmap decodeUtf8) (optional "scope" validScope "")
+  <*> (lift (param "scope") >>= scopeParser)
   <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
 
+ where
+
+  scopeParser = maybe useDefault (goParse . Text.words . decodeUtf8)
+
+    where
+
+      useDefault =
+        maybe
+            (Error.left "You must provide a scope")
+            (return  . Set.fromList)
+            defaultScope
+
+      goParse scopes =
+        let parsed = map parseScope scopes
+        in if any Error.isNothing parsed
+            then Error.left "Could not parse scope"
+            else return (Set.fromList $ Error.catMaybes parsed)
 
 --------------------------------------------------------------------------------
 parseTokenRequestParameters :: ParameterParser AccessTokenRequest
@@ -506,11 +546,6 @@ redirectUriField = optional "redirect_uri" validRedirectUri
 --------------------------------------------------------------------------------
 validRedirectUri :: BS.ByteString -> Bool
 validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
-
-
---------------------------------------------------------------------------------
-validScope :: BS.ByteString -> Bool
-validScope _  = True
 
 
 --------------------------------------------------------------------------------
