@@ -8,12 +8,7 @@ module Snap.Snaplet.OAuth2
 
       -- * Authorization 'Snap.Handler's
     , AuthorizationResult(..)
-    , AuthorizationRequest
     , Code
-    , authReqClientId
-    , authReqRedirectUri
-    , authReqScope
-    , authReqState
 
     -- * 'Client's
     , Client
@@ -155,26 +150,6 @@ data AuthorizationResult =
 
     -- | The resource owner has granted permission.
   | Granted
-
-
---------------------------------------------------------------------------------
--- | Information about an authorization request from a client.
-data AuthorizationRequest scope = AuthorizationRequest
-  { -- | The client's unique identifier.
-    authReqClientId :: Text
-
-    -- | The (optional) redirection URI to redirect to on success. The OAuth
-    -- snaplet will take care of this redirection; you do not need to perform the
-    -- redirection yourself.
-  , authReqRedirectUri :: URI.URI
-
-    -- | The scope of authorization requested.
-  , authReqScope :: Set.Set scope
-
-    -- | Any state the client wishes to be associated with the authorization
-    -- request.
-  , authReqState :: Maybe Text
-  }
 
 
 --------------------------------------------------------------------------------
@@ -365,12 +340,12 @@ authorizationRequest authSnap genericDisplay =
         InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
         Denied     -> Error.left $ AuthorizationGrant.AccessDenied
 
-    redirectError authReq oAuthError =
-        let uri = authReqRedirectUri authReq
-        in augmentedRedirect uri
-            [ ("error", show $ errorCode oAuthError)
-            , ("error_description", Text.unpack $ errorBody oAuthError)
-            ]
+    {-redirectError authReq oAuthError =-}
+        {-let uri = authReqRedirectUri authReq-}
+        {-in augmentedRedirect uri-}
+            {-[ ("error", show $ errorCode oAuthError)-}
+            {-, ("error_description", Text.unpack $ errorBody oAuthError)-}
+            {-]-}
 
     augmentedRedirect uri params =
       Snap.redirect $ encodeUtf8 $ pack $ show $ uri
