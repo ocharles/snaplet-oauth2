@@ -96,13 +96,13 @@ showCode code = blaze $ pageTemplate "Authorization Code" $ do
 
 --------------------------------------------------------------------------------
 -- Our protected resource that requires authentication.
-{-protected :: Handler App App ()-}
-{-protected = with oAuth $ protect [ReadSecretDocuments] deny $-}
-    {-blaze $ pageTemplate "Protected" $ do-}
-        {-H.h1 "Secret Information"-}
-        {-H.p "The brief case is with Gray Squirrel"-}
-  {-where-}
-    {-deny = writeText "Denied"-}
+protected :: Handler App App ()
+protected = with oAuth $ protect [ReadSecretDocuments] deny $
+    blaze $ pageTemplate "Protected" $ do
+        H.h1 "Secret Information"
+        H.p "The brief case is with Gray Squirrel"
+  where
+    deny = writeText "Denied"
 
 
 --------------------------------------------------------------------------------
@@ -112,7 +112,7 @@ showCode code = blaze $ pageTemplate "Authorization Code" $ do
 -- to copy and paste.
 appInit :: SnapletInit App App
 appInit = makeSnaplet "oauth-example" "Example OAuth server" Nothing $ do
-  {-addRoutes [ ("/protected", protected) ]-}
+  addRoutes [ ("/protected", protected) ]
   App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode)
 
 
