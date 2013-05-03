@@ -31,7 +31,7 @@ import Control.Applicative ((<$>), (<|>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
-import Control.Monad ((>=>), guard, unless, void, when)
+import Control.Monad ((<=<), (>=>), guard, unless, void, when)
 import Data.Aeson (ToJSON(..), Value, encode, (.=), object)
 import Data.Maybe (fromMaybe)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -301,8 +301,8 @@ authorizationRequest authSnap genericDisplay =
         clientId <- Error.fmapLT showClientError $
             decodeUtf8 <$> requireOne "client_id"
 
-        client <- liftIO =<<
-            lift (withBackend' $ \be -> lookupClient be clientId)
+        client <- lift $ nestBackend $
+            \be -> lookupClient be clientId
         maybe (Error.left "Client not found") return client
 
     parseRedirectUri = do
@@ -340,8 +340,7 @@ authorizationRequest authSnap genericDisplay =
                 , authGrantScope = scope
                 }
 
-        liftIO =<< lift (
-            withBackend' $ \be -> storeAuthorizationGrant be authGrant)
+        lift $ nestBackend $ \be -> storeAuthorizationGrant be authGrant
 
         return authGrant
 
@@ -470,17 +469,11 @@ scopeParser = maybe useDefault (goParse . Text.words . decodeUtf8)
 
 
 --------------------------------------------------------------------------------
-withBackend :: (forall o. (OAuthBackend o) => o scope -> Snap.Handler b (OAuth scope) a)
+nestBackend :: (forall o. (OAuthBackend o) => o scope -> IO a)
             -> Snap.Handler b (OAuth scope) a
-withBackend a = do (OAuth be _) <- get
-                   a be
-
-
---------------------------------------------------------------------------------
-withBackend' :: (forall o. (OAuthBackend o) => o scope -> a)
-             -> Snap.Handler b (OAuth scope) a
-withBackend' a = do (OAuth be _) <- get
-                    return $ a be
+nestBackend x = do
+    (OAuth be _) <- get
+    liftIO (x be)
 
 
 --------------------------------------------------------------------------------
@@ -530,8 +523,8 @@ protect scope failure h =
                     <|> postParameter
                     <|> queryParameter
 
-        token <- Error.MaybeT $ withBackend $
-            \be -> liftIO $ lookupToken be reqToken
+        token <- Error.MaybeT $ nestBackend $
+            \be -> lookupToken be reqToken
 
         now <- liftIO getCurrentTime
         guard (now < accessTokenExpiresAt token)
