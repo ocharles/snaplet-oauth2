@@ -5,3 +5,4 @@ data ErrorCode
   = InvalidRequest | UnauthorizedClient | AccessDenied
   | UnsupportedResponseType | InvalidScope | ServerError
   | TemporarilyUnavailable
+ deriving (Show)

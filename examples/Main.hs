@@ -51,8 +51,8 @@ makeLenses ''App
 --
 -- Most applications will need to extend this to perform some actual
 -- authentication, for example using 'Snap.Snaplet.Auth'.
-doLogin :: [AppScope] -> Handler App (OAuth AppScope) AuthorizationResult
-doLogin scope = do
+doLogin :: Client -> [AppScope] -> Handler App (OAuth AppScope) AuthorizationResult
+doLogin client scope = do
   possibleResponse <- getParam "response"
   case possibleResponse of
     Just "Deny" -> do
@@ -96,13 +96,13 @@ showCode code = blaze $ pageTemplate "Authorization Code" $ do
 
 --------------------------------------------------------------------------------
 -- Our protected resource that requires authentication.
-protected :: Handler App App ()
-protected = with oAuth $ protect [ReadSecretDocuments] deny $
-    blaze $ pageTemplate "Protected" $ do
-        H.h1 "Secret Information"
-        H.p "The brief case is with Gray Squirrel"
-  where
-    deny = writeText "Denied"
+{-protected :: Handler App App ()-}
+{-protected = with oAuth $ protect [ReadSecretDocuments] deny $-}
+    {-blaze $ pageTemplate "Protected" $ do-}
+        {-H.h1 "Secret Information"-}
+        {-H.p "The brief case is with Gray Squirrel"-}
+  {-where-}
+    {-deny = writeText "Denied"-}
 
 
 --------------------------------------------------------------------------------
@@ -112,7 +112,7 @@ protected = with oAuth $ protect [ReadSecretDocuments] deny $
 -- to copy and paste.
 appInit :: SnapletInit App App
 appInit = makeSnaplet "oauth-example" "Example OAuth server" Nothing $ do
-  addRoutes [ ("/protected", protected) ]
+  {-addRoutes [ ("/protected", protected) ]-}
   App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode)
 
 

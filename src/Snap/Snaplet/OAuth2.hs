@@ -15,6 +15,9 @@ module Snap.Snaplet.OAuth2
     , authReqScope
     , authReqState
 
+    -- * 'Client's
+    , Client
+
       -- * Scope
     , Scope(..)
 
@@ -28,7 +31,7 @@ import Control.Applicative ((<$>), (<|>), (<*>), (<*), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
-import Control.Monad ((>=>), guard, unless)
+import Control.Monad ((>=>), guard, unless, void, when)
 import Data.Aeson (ToJSON(..), Value, encode, (.=), object)
 import Data.Maybe (fromMaybe)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
@@ -48,6 +51,7 @@ import qualified Data.IORef as IORef
 import qualified Data.Map as Map
 import qualified Data.Text as Text
 import qualified Data.Set as Set
+import qualified Network.URI as URI
 import qualified Snap.Core as Snap
 import qualified Snap.Snaplet as Snap
 import qualified Snap.Snaplet.Session.Common as Snap
@@ -77,6 +81,9 @@ class OAuthBackend oauth where
 
     -- | Attempt to lookup an access token.
     lookupToken :: oauth scope -> Code -> IO (Maybe (AccessToken scope))
+
+    -- | Try and find a 'Client' by their 'clientId'.
+    lookupClient :: oauth scope -> Text -> IO (Maybe Client)
 
 
 --------------------------------------------------------------------------------
@@ -120,6 +127,13 @@ instance OAuthBackend InMemoryOAuth where
   lookupToken be token =
     Map.lookup token <$> IORef.readIORef (oAuthAliveTokens be)
 
+  lookupClient be _ =
+    pure $ Just
+        Client { clientId = "fred"
+               , clientRedirectUri = Error.fromMaybe (error "???") $
+                        URI.parseURI "http://google.com"
+               }
+
 --------------------------------------------------------------------------------
 -- | The OAuth snaplet. You should nest this inside your application snaplet
 -- using 'nestSnaplet' with the 'initInMemoryOAuth' initializer.
@@ -152,7 +166,7 @@ data AuthorizationRequest scope = AuthorizationRequest
     -- | The (optional) redirection URI to redirect to on success. The OAuth
     -- snaplet will take care of this redirection; you do not need to perform the
     -- redirection yourself.
-  , authReqRedirectUri :: Maybe BS.ByteString
+  , authReqRedirectUri :: URI.URI
 
     -- | The scope of authorization requested.
   , authReqScope :: Set.Set scope
@@ -167,8 +181,8 @@ data AuthorizationRequest scope = AuthorizationRequest
 data AuthorizationGrant scope = AuthorizationGrant
   { authGrantCode :: Code
   , authGrantExpiresAt :: UTCTime
-  , authGrantRedirectUri :: Maybe BS.ByteString
-  , authGrantClientId :: Text
+  , authGrantRedirectUri :: URI.URI
+  , authGrantClient :: Client
   , authGrantScope :: Set.Set scope
   }
 
@@ -176,7 +190,7 @@ data AuthorizationGrant scope = AuthorizationGrant
 --------------------------------------------------------------------------------
 data AccessTokenRequest = AccessTokenRequest
   { accessTokenReqCode :: Code
-  , accessTokenReqRedirect :: Maybe BS.ByteString
+  , accessTokenReqRedirect :: URI.URI
   , accessTokenReqClientId :: Text
   }
 
@@ -208,6 +222,13 @@ class Ord a => Scope a where
 
 
 --------------------------------------------------------------------------------
+data Client = Client { clientRedirectUri :: URI.URI
+                     , clientId :: Text
+                     }
+  deriving (Eq, Show)
+
+
+--------------------------------------------------------------------------------
 accessTokenToJSON :: MonadIO m => (AccessToken scope) -> m Value
 accessTokenToJSON at = do
     now <- liftIO getCurrentTime
@@ -220,136 +241,232 @@ accessTokenToJSON at = do
 
 
 --------------------------------------------------------------------------------
-authorizationRequest :: Scope scope
-                     => ([scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
-                     -> (Code -> Snap.Handler b (OAuth scope) ())
-                     -> Snap.Handler b (OAuth scope) ()
-authorizationRequest authSnap genericDisplay = Error.eitherT id authReqStored $ do
-    -- Parse the request for validity.
-    authReq <- runParamParser Snap.getQueryParams parseAuthorizationRequestParameters
-                 Snap.writeText
+data RequireFailure = MoreThanOne | Missing
 
-    -- Confirm with the resource owner that they wish to grant this request.
-    verifyWithResourceOwner authReq
+--------------------------------------------------------------------------------
+requireOne :: Snap.MonadSnap m =>
+    BS.ByteString
+    -> Error.EitherT RequireFailure m BS.ByteString
+requireOne k = do
+    vs <- Map.lookup k <$> lift Snap.getQueryParams
 
-    -- Produce a new authorization code.
-    code <- lift newCSRFToken
-    now <- liftIO getCurrentTime
-    let authGrant = AuthorizationGrant
-          { authGrantCode = code
-          , authGrantExpiresAt = addUTCTime 600 now
-          , authGrantRedirectUri = authReqRedirectUri authReq
-          , authGrantClientId = authReqClientId authReq
-          , authGrantScope = authReqScope authReq
-          }
-    lift (withBackend' $ \be -> storeAuthorizationGrant be authGrant) >>= liftIO
-
-    return (code, authReq)
-
-  where
-    authReqStored (code, authReq) =
-      case authReqRedirectUri authReq of
-        Just "urn:ietf:wg:oauth:2.0:oob" -> genericDisplay code
-        Just uri -> augmentedRedirect uri [ ("code", Text.unpack code) ]
-        Nothing -> genericDisplay code
-
-    augmentedRedirect uri params =
-      -- We have already validated this in the request parser.
-      let uri' = fromMaybe (error "Invalid redirect") $ parseAbsoluteURI $
-                   Text.unpack $ decodeUtf8 uri
-      in Snap.redirect $ encodeUtf8 $ pack $ show $ uri'
-           { uriQuery = ("?" ++) $ exportParams $
-                        (fromMaybe [] $ importParams $ uriQuery uri') ++
-                        params }
-
-    verifyWithResourceOwner authReq = do
-      authResult <- lift $ authSnap (Set.toList $ authReqScope authReq)
-      case authResult of
-        Granted    -> Error.right ()
-        InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
-        Denied     -> Error.left $ redirectError authReq $
-                        Error
-                          AccessToken.AccessDenied
-                          "The resource owner has denied this request"
-
-    redirectError authReq oAuthError = do
-      case authReqRedirectUri authReq of
-        Just uri -> augmentedRedirect uri
-                      [ ("error", show $ errorCode oAuthError)
-                      , ("error_description", Text.unpack $ errorBody oAuthError)
-                      ]
+    case vs of
+        Just [v] -> return v
+        Just (_ : _) -> Error.left MoreThanOne
+        _ -> Error.left Missing
 
 
 --------------------------------------------------------------------------------
-requestToken :: Snap.Handler b (OAuth scope) ()
-requestToken = Error.eitherT jsonError success $ do
-    -- Parse the request into a AccessTokenRequest.
-    tokenReq <- runParamParser Snap.getPostParams parseTokenRequestParameters
-                  (Error AccessToken.InvalidRequest)
+optionalOne :: Snap.MonadSnap m =>
+    BS.ByteString
+    -> Error.EitherT RequireFailure m (Maybe BS.ByteString)
+optionalOne k = do
+    vs <- Map.lookup k <$> lift Snap.getQueryParams
 
-    -- Find the authorization grant, failing if it can't be found.
-    -- Error.EitherT $ (fmap.fmap) (Error.note (notFound tokenReq)) $
-    grant <- do
-      ioGrant <- lift $ withBackend' $ \be -> inspectAuthorizationGrant be
-                   (accessTokenReqCode tokenReq)
-      Error.EitherT $ fmap (Error.note $ notFound tokenReq) $
-        liftIO ioGrant
+    case vs of
+        Just [v] -> return $ Just v
+        Just (_ : _) -> Error.left MoreThanOne
+        _ -> return Nothing
 
-    -- Require that the current redirect URL matches the one an authorization
-    -- token was granted to.
-    (authGrantRedirectUri grant == accessTokenReqRedirect tokenReq)
-      `orFail` mismatchedClientRedirect
 
-    -- Require that the client IDs match.
-    (accessTokenReqClientId tokenReq == authGrantClientId grant)
-      `orFail` mismatchedClient
-
-    -- Require that the token has not expired.
-    now <- liftIO getCurrentTime
-    (now <= authGrantExpiresAt grant) `orFail` expired
-
-    -- All good, grant a new access token!
-    token <- lift newCSRFToken
-    now <- liftIO getCurrentTime
-    let grantedAccessToken = AccessToken
-          { accessToken = token
-          , accessTokenType = Bearer
-          , accessTokenExpiresAt = 3600 `addUTCTime` now
-          , accessTokenRefreshToken = token
-          , accessTokenClientId = accessTokenReqClientId tokenReq
-          , accessTokenScope = authGrantScope grant
-          }
-
-    -- Store the granted access token, handling backend failure.
-    lift (withBackend' $ \be -> storeToken be grantedAccessToken) >>= liftIO
-    return grantedAccessToken
+--------------------------------------------------------------------------------
+authorizationRequest :: Scope scope
+                     => (Client -> [scope]
+                         -> Snap.Handler b (OAuth scope) AuthorizationResult)
+                     -> (Code -> Snap.Handler b (OAuth scope) ())
+                     -> Snap.Handler b (OAuth scope) ()
+authorizationRequest authSnap genericDisplay =
+    Error.eitherT displayAuthError processAuthRequest checkClientValidity
 
   where
-    success = accessTokenToJSON >=> writeJSON
 
-    notFound tokenReq = Error AccessToken.InvalidGrant
-      (Text.append "Authorization request not found: " $
-         accessTokenReqCode tokenReq)
+    checkClientValidity = do
+        client <- findClient
+        redirectUri <- parseRedirectUri
+        checkRedirectMatchesClient client redirectUri
 
-    expired = Error AccessToken.InvalidGrant
-      "This authorization grant has expired"
+        return client
 
-    mismatchedClient = Error AccessToken.InvalidGrant
-      "This authorization token was issued to another client"
+    processAuthRequest client = Error.eitherT handleError authReqGranted $ do
+        mandateCodeResponseType
+        scope <- parseScope
+        verifyWithResourceOwner client scope
+        produceAuthGrant client scope
 
-    mismatchedClientRedirect = Error AccessToken.InvalidGrant $
-      Text.append "The redirection URL does not match the redirection URL in "
-        "the original authorization grant"
+    findClient = do
+        let showClientError e = case e of
+                MoreThanOne -> "More than one client_id specified"
+                Missing -> "Required client_id parameter not specified"
 
-    True  `orFail` _ = return ()
-    False `orFail` a = Error.left a
+        clientId <- Error.fmapLT showClientError $
+            decodeUtf8 <$> requireOne "client_id"
 
-    jsonError e = Snap.modifyResponse (Snap.setResponseCode 400) >> writeJSON e
+        client <- liftIO =<<
+            lift (withBackend' $ \be -> lookupClient be clientId)
+        maybe (Error.left "Client not found") return client
 
-    writeJSON :: (ToJSON a, Snap.MonadSnap m) => a -> m ()
-    writeJSON j = do
-      Snap.modifyResponse $ Snap.setContentType "application/json"
-      Snap.writeLBS $ encode j
+    parseRedirectUri = do
+        let showRedirectError e = case e of
+                MoreThanOne -> "More than one redirect_uri specified"
+                Missing -> "Required redirect_uri parameter not specified"
+
+        unparsedUri <- Error.fmapLT showRedirectError $
+            requireOne "redirect_uri"
+
+        maybe (Error.left "Request URI is not well formed") return $
+            URI.parseURI . Text.unpack . decodeUtf8 $ unparsedUri
+
+    checkRedirectMatchesClient client redirectUri =
+        when (redirectUri /= clientRedirectUri client) $
+            Error.left "Mismatching redirection URI"
+
+    mandateCodeResponseType =
+        Error.fmapLT (const AuthorizationGrant.InvalidRequest) $
+            discardError (requireOne "response_type") >>=
+                guard . (== "code")
+
+    parseScope = Error.EitherT . return . scopeParser =<<
+        Error.fmapLT (const AuthorizationGrant.InvalidRequest)
+            (optionalOne "scope")
+
+    produceAuthGrant client scope = do
+        code <- lift newCSRFToken
+        now <- liftIO getCurrentTime
+        let authGrant = AuthorizationGrant
+                { authGrantCode = code
+                , authGrantExpiresAt = addUTCTime 600 now
+                , authGrantRedirectUri = clientRedirectUri client
+                , authGrantClient = client
+                , authGrantScope = scope
+                }
+
+        liftIO =<< lift (
+            withBackend' $ \be -> storeAuthorizationGrant be authGrant)
+
+        return authGrant
+
+    discardError = Error.fmapLT (const ())
+
+    displayAuthError e = Snap.writeText e
+
+    handleError = Snap.writeText . Text.pack . show
+
+    authReqGranted authGrant =
+        let uri = clientRedirectUri $ authGrantClient authGrant
+            Just noRedirect = URI.parseURI "urn:ietf:wg:oauth:2.0:oob"
+            code = authGrantCode authGrant
+        in if uri == noRedirect
+            then genericDisplay code
+            else augmentedRedirect uri [ ("code", Text.unpack code) ]
+
+    verifyWithResourceOwner client scope = do
+      authResult <- lift $ authSnap client (Set.toList $ scope)
+      case authResult of
+        Granted    -> Error.right $ AuthorizationGrant.AccessDenied
+        InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
+        Denied     -> Error.left $ AuthorizationGrant.AccessDenied
+
+    redirectError authReq oAuthError =
+        let uri = authReqRedirectUri authReq
+        in augmentedRedirect uri
+            [ ("error", show $ errorCode oAuthError)
+            , ("error_description", Text.unpack $ errorBody oAuthError)
+            ]
+
+    augmentedRedirect uri params =
+      Snap.redirect $ encodeUtf8 $ pack $ show $ uri
+          { uriQuery = ("?" ++) $ exportParams $
+                       (fromMaybe [] $ importParams $ uriQuery uri) ++
+                       params }
+
+
+--------------------------------------------------------------------------------
+scopeParser :: Scope scope =>
+    Maybe BS.ByteString -> Either AuthorizationGrant.ErrorCode (Set.Set scope)
+scopeParser = maybe useDefault (goParse . Text.words . decodeUtf8)
+
+  where
+
+    useDefault = maybe
+        (Left AuthorizationGrant.InvalidScope)
+        (Right . Set.fromList)
+         defaultScope
+
+    goParse scopes =
+        let parsed = map parseScope scopes
+        in if any Error.isNothing parsed
+            then Left AuthorizationGrant.InvalidScope
+            else Right (Set.fromList $ Error.catMaybes parsed)
+
+--------------------------------------------------------------------------------
+{-requestToken :: Snap.Handler b (OAuth scope) ()-}
+{-requestToken = Error.eitherT jsonError success $ do-}
+    {--- Parse the request into a AccessTokenRequest.-}
+    {-tokenReq <- lift Snap.getPostParams >>= runParamParser parseTokenRequestParameters-}
+
+    {--- Find the authorization grant, failing if it can't be found.-}
+    {--- Error.EitherT $ (fmap.fmap) (Error.note (notFound tokenReq)) $-}
+    {-grant <- do-}
+      {-ioGrant <- lift $ withBackend' $ \be -> inspectAuthorizationGrant be-}
+                   {-(accessTokenReqCode tokenReq)-}
+      {-Error.EitherT $ fmap (Error.note $ notFound tokenReq) $-}
+        {-liftIO ioGrant-}
+
+    {--- Require that the current redirect URL matches the one an authorization-}
+    {--- token was granted to.-}
+    {-(authGrantRedirectUri grant == accessTokenReqRedirect tokenReq)-}
+      {-`orFail` mismatchedClientRedirect-}
+
+    {--- Require that the client IDs match.-}
+    {-(accessTokenReqClientId tokenReq == clientId (authGrantClient grant))-}
+      {-`orFail` mismatchedClient-}
+
+    {--- Require that the token has not expired.-}
+    {-now <- liftIO getCurrentTime-}
+    {-(now <= authGrantExpiresAt grant) `orFail` expired-}
+
+    {--- All good, grant a new access token!-}
+    {-token <- lift newCSRFToken-}
+    {-now <- liftIO getCurrentTime-}
+    {-let grantedAccessToken = AccessToken-}
+          {-{ accessToken = token-}
+          {-, accessTokenType = Bearer-}
+          {-, accessTokenExpiresAt = 3600 `addUTCTime` now-}
+          {-, accessTokenRefreshToken = token-}
+          {-, accessTokenClientId = accessTokenReqClientId tokenReq-}
+          {-, accessTokenScope = authGrantScope grant-}
+          {-}-}
+
+    {--- Store the granted access token, handling backend failure.-}
+    {-lift (withBackend' $ \be -> storeToken be grantedAccessToken) >>= liftIO-}
+    {-return grantedAccessToken-}
+
+  {-where-}
+    {-success = accessTokenToJSON >=> writeJSON-}
+
+    {-notFound tokenReq = Error AccessToken.InvalidGrant-}
+      {-(Text.append "Authorization request not found: " $-}
+         {-accessTokenReqCode tokenReq)-}
+
+    {-expired = Error AccessToken.InvalidGrant-}
+      {-"This authorization grant has expired"-}
+
+    {-mismatchedClient = Error AccessToken.InvalidGrant-}
+      {-"This authorization token was issued to another client"-}
+
+    {-mismatchedClientRedirect = Error AccessToken.InvalidGrant $-}
+      {-Text.append "The redirection URL does not match the redirection URL in "-}
+        {-"the original authorization grant"-}
+
+    {-True  `orFail` _ = return ()-}
+    {-False `orFail` a = Error.left a-}
+
+    {-jsonError e = Snap.modifyResponse (Snap.setResponseCode 400) >> writeJSON e-}
+
+    {-writeJSON :: (ToJSON a, Snap.MonadSnap m) => a -> m ()-}
+    {-writeJSON j = do-}
+      {-Snap.modifyResponse $ Snap.setContentType "application/json"-}
+      {-Snap.writeLBS $ encode j-}
 
 
 --------------------------------------------------------------------------------
@@ -376,7 +493,7 @@ newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
 initInMemoryOAuth :: Scope scope
-                  =>([scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
+                  =>(Client -> [scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
                   -- ^ A handler to perform authorization against the server.
                   -> (Code -> Snap.Handler b (OAuth scope) ())
                   -- ^ A handler to display an authorization request 'Code' to
@@ -386,7 +503,7 @@ initInMemoryOAuth authSnap genericCodeDisplay =
   Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
     Snap.addRoutes
       [ ("/auth", authorizationRequest authSnap genericCodeDisplay)
-      , ("/token", requestToken)
+      {-, ("/token", requestToken)-}
       ]
 
     codeStore <- liftIO $ MVar.newMVar Map.empty
@@ -439,98 +556,15 @@ protect scope failure h =
     queryParameter =
         decodeUtf8 <$> Error.MaybeT (Snap.getQueryParam "access_token")
 
---------------------------------------------------------------------------------
--- | Parameter parsers are a combination of 'Reader.Reader'/'Error.EitherT'
--- monads. The environment is a 'Snap.Params' map (from Snap), and
--- 'Error.EitherT' allows us to fail validation at any point. Combinators
--- 'require' and 'optional' take a parameter key, and a validation routine.
-type ParameterParser e a = Error.EitherT e (Reader.Reader Snap.Params) a
+{----------------------------------------------------------------------------------}
+{-parseTokenRequestParameters :: ParameterParser (Error AccessToken.ErrorCode) AccessTokenRequest-}
+{-parseTokenRequestParameters = pure AccessTokenRequest-}
+  {-<*  liftError AccessToken.UnsupportedGrantType-}
+        {-(require "grant_type" (== "authorization_code")-}
+           {-"grant_type must be authorization_code")-}
+  {-<*> liftError AccessToken.InvalidRequest-}
+        {-(decodeUtf8 <$> require "code" (const True) "")-}
+  {-<*> liftError AccessToken.InvalidRequest-}
+        {-redirectUriField-}
+  {-<*> liftError AccessToken.InvalidClient clientIdField-}
 
-
---------------------------------------------------------------------------------
-param :: String -> Reader.Reader Snap.Params (Maybe BS.ByteString)
-param p = fmap head . Map.lookup (encodeUtf8 . Text.pack $ p) <$> Reader.ask
-
-
---------------------------------------------------------------------------------
-require :: String -> (BS.ByteString -> Bool) -> Text
-        -> ParameterParser Text BS.ByteString
-require name predicate e = do
-  v <- Error.EitherT $
-         Error.note (Text.append (pack name) " is required") <$> param name
-  unless (predicate v) $ Error.left e
-  return v
-
-
---------------------------------------------------------------------------------
-optional :: String -> (BS.ByteString -> Bool) -> Text
-         -> ParameterParser Text (Maybe BS.ByteString)
-optional name predicate e = do
-  v <- lift (param name)
-  case v of
-    Just v' -> if predicate v' then return v else Error.left e
-    Nothing -> return Nothing
-
-
---------------------------------------------------------------------------------
-parseAuthorizationRequestParameters :: Scope scope => ParameterParser Text (AuthorizationRequest scope)
-parseAuthorizationRequestParameters = pure AuthorizationRequest
-  <*  require "response_type" (== "code") "response_type must be code"
-  <*> clientIdField
-  <*> redirectUriField
-  <*> (lift (param "scope") >>= scopeParser)
-  <*> fmap (fmap decodeUtf8) (optional "state" (const True) "")
-
- where
-
-  scopeParser = maybe useDefault (goParse . Text.words . decodeUtf8)
-
-    where
-
-      useDefault =
-        maybe
-            (Error.left "You must provide a scope")
-            (return  . Set.fromList)
-            defaultScope
-
-      goParse scopes =
-        let parsed = map parseScope scopes
-        in if any Error.isNothing parsed
-            then Error.left "Could not parse scope"
-            else return (Set.fromList $ Error.catMaybes parsed)
-
---------------------------------------------------------------------------------
-parseTokenRequestParameters :: ParameterParser Text AccessTokenRequest
-parseTokenRequestParameters = pure AccessTokenRequest
-  <*  require "grant_type" (== "authorization_code")
-        "grant_type must be authorization_code"
-  <*> fmap decodeUtf8 (require "code" (const True) "")
-  <*> redirectUriField
-  <*> clientIdField
-
-
---------------------------------------------------------------------------------
-clientIdField :: ParameterParser Text Text
-clientIdField = fmap decodeUtf8 (require "client_id" (const True) "")
-
-
---------------------------------------------------------------------------------
-redirectUriField :: ParameterParser Text (Maybe BS.ByteString)
-redirectUriField = optional "redirect_uri" validRedirectUri
-  (Text.append "redirect_uri must be an absolute URI and not contain a "
-               "fragment component")
-
-
---------------------------------------------------------------------------------
-validRedirectUri :: BS.ByteString -> Bool
-validRedirectUri = isAbsoluteURI . Text.unpack . decodeUtf8
-
-
---------------------------------------------------------------------------------
-runParamParser :: Snap.MonadSnap m => m Snap.Params -> ParameterParser e a -> (e -> e')
-               -> Error.EitherT e' m a
-runParamParser params parser errorFmt = do
-  qps <- lift params
-  case Reader.runReader (Error.runEitherT parser) qps of
-    Left e -> Error.left (errorFmt e)
-    Right a -> Error.right a
