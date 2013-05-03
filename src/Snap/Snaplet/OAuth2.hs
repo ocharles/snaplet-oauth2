@@ -22,25 +22,24 @@ module Snap.Snaplet.OAuth2
 
 
 --------------------------------------------------------------------------------
-import Control.Applicative ((<$>), (<|>), (<*>), (<*), pure)
+import Control.Applicative ((<$>), (<|>), pure)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
-import Control.Monad ((<=<), (>=>), guard, unless, void, when)
-import Data.Aeson (ToJSON(..), Value, encode, (.=), object)
+import Control.Monad (guard, when)
+import Data.Aeson (ToJSON(..), Value, (.=), object)
 import Data.Maybe (fromMaybe)
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Text (Text, pack)
 import Data.Time (UTCTime, addUTCTime, getCurrentTime, diffUTCTime)
 import Data.Tuple (swap)
-import Network.URI (isAbsoluteURI, parseAbsoluteURI, uriQuery)
+import Network.URI (uriQuery)
 import Network.URL (importParams, exportParams)
 
 
 --------------------------------------------------------------------------------
 import qualified Control.Concurrent.MVar as MVar
 import qualified Control.Error as Error
-import qualified Control.Monad.Trans.Reader as Reader
 import qualified Data.ByteString as BS
 import qualified Data.IORef as IORef
 import qualified Data.Map as Map
@@ -51,7 +50,6 @@ import qualified Snap.Core as Snap
 import qualified Snap.Snaplet as Snap
 import qualified Snap.Snaplet.Session.Common as Snap
 
-import qualified Snap.Snaplet.OAuth2.AccessToken as AccessToken
 import qualified Snap.Snaplet.OAuth2.AuthorizationGrant as AuthorizationGrant
 
 --------------------------------------------------------------------------------
