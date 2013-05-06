@@ -9,6 +9,7 @@ module Snap.Snaplet.OAuth2
       -- * Authorization 'Snap.Handler's
     , AuthorizationResult(..)
     , Code
+    , AuthorizationGrantError(..)
 
     -- * 'Client's
     , Client(..)
@@ -182,6 +183,7 @@ class Ord a => Scope a where
 --------------------------------------------------------------------------------
 data Client = Client { clientRedirectUri :: URI.URI
                      , clientId :: Text
+                     , clientName :: Text
                      }
   deriving (Eq, Ord, Show)
 
@@ -199,11 +201,12 @@ accessTokenToJSON at = do
 
 
 --------------------------------------------------------------------------------
-data RequireFailure = MoreThanOne | Missing
+data ParameterFailure = MoreThanOne | Missing
+  deriving (Enum, Eq, Ord, Show)
 
 --------------------------------------------------------------------------------
 requireOne :: BS.ByteString -> Snap.Params
-           -> Either RequireFailure BS.ByteString
+           -> Either ParameterFailure BS.ByteString
 requireOne k m = do
     optionally <- optionalOne k m
     case optionally of
@@ -213,7 +216,7 @@ requireOne k m = do
 
 --------------------------------------------------------------------------------
 optionalOne :: BS.ByteString
-            -> Snap.Params -> Either RequireFailure (Maybe BS.ByteString)
+            -> Snap.Params -> Either ParameterFailure (Maybe BS.ByteString)
 optionalOne k m = case Map.lookup k m of
         Just [v] -> return $ Just v
         Just (_ : _) -> Left MoreThanOne
@@ -221,13 +224,22 @@ optionalOne k m = case Map.lookup k m of
 
 
 --------------------------------------------------------------------------------
+data AuthorizationGrantError = InvalidRedirectionUri ParameterFailure
+                             | InvalidClientId ParameterFailure
+                             | MalformedRedirectionUri BS.ByteString
+                             | MismatchingRedirectionUri Client
+                             | UnknownClient Text
+  deriving (Eq, Ord, Show)
+
+--------------------------------------------------------------------------------
 authorizationRequest :: Scope scope
                      => (Client -> [scope]
                          -> Snap.Handler b (OAuth scope) AuthorizationResult)
                      -> (Code -> Snap.Handler b (OAuth scope) ())
+                     -> (AuthorizationGrantError -> Snap.Handler b (OAuth scope) ())
                      -> Snap.Handler b (OAuth scope) ()
-authorizationRequest authSnap genericDisplay =
-    Error.eitherT displayAuthError processAuthRequest checkClientValidity
+authorizationRequest authSnap genericDisplay displayAuthGrantError =
+    Error.eitherT displayAuthGrantError processAuthRequest checkClientValidity
 
   where
 
@@ -247,28 +259,24 @@ authorizationRequest authSnap genericDisplay =
             produceAuthGrant client scope
 
     findClient = do
-        let showClientError e = case e of
-                MoreThanOne -> "More than one client_id specified"
-                Missing -> "Required client_id parameter not specified"
-
-        reqClientId <- Error.fmapLT showClientError $
+        reqClientId <- Error.fmapLT InvalidClientId $
             decodeUtf8 <$> queryRequire "client_id"
 
         client <- lift $ nestBackend $
             \be -> lookupClient be reqClientId
-        maybe (Error.left "Client not found") return client
+        maybe (Error.left (UnknownClient reqClientId)) return client
 
     parseRedirectUri = do
-        let showRedirectError e = case e of
-                MoreThanOne -> "More than one redirect_uri specified"
-                Missing -> "Required redirect_uri parameter not specified"
+        unparsedUri <- Error.fmapLT InvalidRedirectionUri $
+            queryRequire "redirect_uri"
 
-        Error.EitherT . return . Error.note "Request URI is not well formed" .
-            parseURI =<< Error.fmapLT showRedirectError (queryRequire "redirect_uri")
+        Error.EitherT . return .
+            Error.note (MalformedRedirectionUri unparsedUri) $
+                parseURI unparsedUri
 
     checkRedirectMatchesClient client redirectUri =
         when (redirectUri /= clientRedirectUri client) $
-            Error.left "Mismatching redirection URI"
+            Error.left (MismatchingRedirectionUri client)
 
     mandateCodeResponseType =
         Error.fmapLT (const AuthorizationGrant.InvalidRequest) $
@@ -295,8 +303,6 @@ authorizationRequest authSnap genericDisplay =
         return authGrant
 
     discardError = Error.fmapLT (const ())
-
-    displayAuthError = Snap.writeText
 
     authReqGranted authGrant =
         let uri = clientRedirectUri $ authGrantClient authGrant
@@ -451,11 +457,16 @@ initInMemoryOAuth :: Scope scope
                   -> (Code -> Snap.Handler b (OAuth scope) ())
                   -- ^ A handler to display an authorization request 'Code' to
                   -- clients.
+                  -> (AuthorizationGrantError -> Snap.Handler b (OAuth scope) ())
+                  -- ^ A handler to display authorization grant errors that are
+                  -- so severe they cannot be redirect back to the client
+                  -- (e.g., the @client-id@ field could not be parsed, thus
+                  -- there is no client to redirect the error response to).
                   -> Snap.SnapletInit b (OAuth scope)
-initInMemoryOAuth authSnap genericCodeDisplay =
+initInMemoryOAuth authSnap genericCodeDisplay authGrantError =
   Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
     Snap.addRoutes
-      [ ("/auth", authorizationRequest authSnap genericCodeDisplay)
+      [ ("/auth", authorizationRequest authSnap genericCodeDisplay authGrantError)
       , ("/token", requestToken)
       ]
 
@@ -474,12 +485,10 @@ protect :: Scope scope
         => [scope]
         -- ^ The scope that a client must have
         -> Snap.Handler b (OAuth scope) ()
-        -- ^ A handler to run if the client is /not/ authorized
-        -> Snap.Handler b (OAuth scope) ()
         -- ^ The handler to run on sucessful authentication.
         -> Snap.Handler b (OAuth scope) ()
-protect scope failure h =
-    Error.maybeT (wwwAuthenticate >> failure) (const h) $ do
+protect scope h =
+    Error.maybeT wwwAuthenticate (const h) $ do
         reqToken <-     authorizationRequestHeader
                     <|> postParameter
                     <|> queryParameter

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
+--------------------------------------------------------------------------------
 module Main where
 
 --------------------------------------------------------------------------------
@@ -7,30 +8,32 @@ import Prelude hiding (unlines)
 
 
 --------------------------------------------------------------------------------
-import qualified Data.Text as T
 import Control.Applicative
-import Control.Monad (forM_, join)
 import Control.Lens.TH
+import Control.Monad (forM_, join)
+import Data.Monoid (mappend)
 import Data.Text.Encoding (decodeUtf8)
+import Network.URI
 import Snap.Blaze
 import Snap.Core
 import Snap.Http.Server
 import Snap.Snaplet
 import Snap.Snaplet.OAuth2
-import Network.URI
+import Text.Blaze.Html5 ((!), toHtml, toValue)
 
 
 --------------------------------------------------------------------------------
-import Text.Blaze.Html5 ((!), toValue)
+import qualified Data.Text as T
 import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as A
 
 
 --------------------------------------------------------------------------------
--- Our application can define whatever scope it needs
+-- Our application can define whatever scope it needs.
 data AppScope = ReadSecretDocuments | CreateDocuments
   deriving (Enum, Eq, Ord, Show)
 
+-- We need to define an isomorphism between the custom scope and 'Text'.
 instance Scope AppScope where
     parseScope "read" = Just ReadSecretDocuments
     parseScope "create" = Just CreateDocuments
@@ -41,7 +44,7 @@ instance Scope AppScope where
 
 
 --------------------------------------------------------------------------------
--- First we define our application as normal, nesting a 'OAuth' 'Snaplet'.
+-- We define our application as normal, nesting an 'OAuth' 'Snaplet'.
 data App = App { _oAuth :: Snaplet (OAuth AppScope) }
 makeLenses ''App
 
@@ -89,10 +92,12 @@ doLogin client scope = do
 registerClient = do
   clientRedirect <- getParam "redirect-uri"
   clientId <- getParam "client-id"
-  case (clientId, join (fmap (parseURI . T.unpack . decodeUtf8) clientRedirect)) of
-    (Just cid, Just redir) -> do
+  clientName <- getParam "name"
+  case (clientName, clientId, join (fmap (parseURI . T.unpack . decodeUtf8) clientRedirect)) of
+    (Just name, Just cid, Just redir) -> do
         with oAuth $ register Client { clientId = decodeUtf8 cid
                                      , clientRedirectUri = redir
+                                     , clientName = decodeUtf8 name
                                      }
         blaze $ pageTemplate "Register Client" $ do
             H.h1 "Client Registered"
@@ -122,6 +127,27 @@ showCode code = blaze $ pageTemplate "Authorization Code" $ do
 
 
 --------------------------------------------------------------------------------
+-- A handler to present authorization grant errors
+showError :: AuthorizationGrantError -> Handler App (OAuth scope) ()
+showError e = blaze $ pageTemplate "Authorization Grant Error" $ do
+    H.h1 "Authorization Grant Error"
+    H.p "An application requested authorization, but the request could not be parsed."
+    case e of
+        InvalidClientId _ ->
+            H.p "The client identifier could not be parsed"
+        InvalidRedirectionUri _ ->
+            H.p "The redirection URI could not be parsed"
+        MalformedRedirectionUri _ ->
+            H.p "The redirection URI does not form a valid URI"
+        MismatchingRedirectionUri client ->
+            H.p $ toHtml $
+                "The redirection URI specified does not match the one registered for "
+                    `mappend` clientName client
+        UnknownClient _ ->
+            H.p "The client with the specified ID has not been registered"
+
+
+--------------------------------------------------------------------------------
 -- Our protected resource that requires authentication.
 protected :: Handler App App ()
 protected = with oAuth $ protect [ReadSecretDocuments] deny $
@@ -142,7 +168,7 @@ appInit = makeSnaplet "oauth-example" "Example OAuth server" Nothing $ do
   addRoutes [ ("/protected", protected)
             , ("/register", registerClient)
             ]
-  App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode)
+  App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode showError)
 
 
 --------------------------------------------------------------------------------
