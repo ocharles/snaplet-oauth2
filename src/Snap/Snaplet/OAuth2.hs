@@ -11,7 +11,8 @@ module Snap.Snaplet.OAuth2
     , Code
 
     -- * 'Client's
-    , Client
+    , Client(..)
+    , register
 
       -- * Scope
     , Scope(..)
@@ -22,7 +23,7 @@ module Snap.Snaplet.OAuth2
 
 
 --------------------------------------------------------------------------------
-import Control.Applicative ((<$>), (<|>), pure)
+import Control.Applicative ((<$>), (<|>))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
@@ -79,6 +80,9 @@ class OAuthBackend oauth where
     -- | Try and find a 'Client' by their 'clientId'.
     lookupClient :: oauth scope -> Text -> IO (Maybe Client)
 
+    -- | Register a client.
+    registerClient :: oauth scope -> Client -> IO ()
+
 
 --------------------------------------------------------------------------------
 -- | The type of both authorization request tokens and access tokens.
@@ -89,6 +93,7 @@ type Code = Text
 data InMemoryOAuth scope = InMemoryOAuth
   { oAuthGranted :: MVar.MVar (Map.Map Code (AuthorizationGrant scope))
   , oAuthAliveTokens :: IORef.IORef (Map.Map Code (AccessToken scope))
+  , oAuthClients :: IORef.IORef (Map.Map Text Client)
   }
 
 
@@ -108,12 +113,12 @@ instance OAuthBackend InMemoryOAuth where
   lookupToken be token =
     Map.lookup token <$> IORef.readIORef (oAuthAliveTokens be)
 
-  lookupClient be _ =
-    pure $ Just
-        Client { clientId = "fred"
-               , clientRedirectUri = Error.fromMaybe (error "???") $
-                        URI.parseURI "http://google.com"
-               }
+  lookupClient be id' =
+    Map.lookup id' <$> IORef.readIORef (oAuthClients be)
+
+  registerClient be client =
+    IORef.modifyIORef (oAuthClients be) (Map.insert (clientId client) client)
+
 
 --------------------------------------------------------------------------------
 -- | The OAuth snaplet. You should nest this inside your application snaplet
@@ -459,8 +464,9 @@ initInMemoryOAuth authSnap genericCodeDisplay =
     codeStore <- liftIO $ MVar.newMVar Map.empty
     aliveTokens <- liftIO $ IORef.newIORef Map.empty
     rng <- liftIO Snap.mkRNG
+    clientStore <- liftIO $ IORef.newIORef Map.empty
 
-    return $ OAuth (InMemoryOAuth codeStore aliveTokens) rng
+    return $ OAuth (InMemoryOAuth codeStore aliveTokens clientStore) rng
 
 
 --------------------------------------------------------------------------------
@@ -504,6 +510,12 @@ protect scope failure h =
     postParameter = decodeAndRequire (Snap.getPostParam "access_token")
 
     queryParameter = decodeAndRequire (Snap.getQueryParam "access_token")
+
+
+--------------------------------------------------------------------------------
+-- | Register a client.
+register :: Client -> Snap.Handler b (OAuth scope) ()
+register client = nestBackend $ \be -> registerClient be client
 
 
 --------------------------------------------------------------------------------

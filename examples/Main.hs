@@ -7,8 +7,9 @@ import Prelude hiding (unlines)
 
 
 --------------------------------------------------------------------------------
+import qualified Data.Text as T
 import Control.Applicative
-import Control.Monad (forM_)
+import Control.Monad (forM_, join)
 import Control.Lens.TH
 import Data.Text.Encoding (decodeUtf8)
 import Snap.Blaze
@@ -16,6 +17,7 @@ import Snap.Core
 import Snap.Http.Server
 import Snap.Snaplet
 import Snap.Snaplet.OAuth2
+import Network.URI
 
 
 --------------------------------------------------------------------------------
@@ -82,6 +84,31 @@ doLogin client scope = do
           H.input ! A.type_ "submit" ! A.name "response" ! A.value "Deny"
       return InProgress
 
+--------------------------------------------------------------------------------
+-- This handler will let clients register
+registerClient = do
+  clientRedirect <- getParam "redirect-uri"
+  clientId <- getParam "client-id"
+  case (clientId, join (fmap (parseURI . T.unpack . decodeUtf8) clientRedirect)) of
+    (Just cid, Just redir) -> do
+        with oAuth $ register Client { clientId = decodeUtf8 cid
+                                     , clientRedirectUri = redir
+                                     }
+        blaze $ pageTemplate "Register Client" $ do
+            H.h1 "Client Registered"
+            H.p "Client successfully registered"
+    _ ->
+      blaze $ pageTemplate "Register Client" $ do
+        H.h1 "Register Client"
+        H.form $ do
+            H.p $ do
+                H.label "Client ID:"
+                H.input ! A.name "client-id"
+            H.p $ do
+                H.label "Redirection URI:"
+                H.input ! A.name "redirect-uri"
+            H.input ! A.type_ "submit" ! A.value "Register"
+
 
 --------------------------------------------------------------------------------
 -- A handler to present an authorization request 'Code' to a client,
@@ -112,7 +139,9 @@ protected = with oAuth $ protect [ReadSecretDocuments] deny $
 -- to copy and paste.
 appInit :: SnapletInit App App
 appInit = makeSnaplet "oauth-example" "Example OAuth server" Nothing $ do
-  addRoutes [ ("/protected", protected) ]
+  addRoutes [ ("/protected", protected)
+            , ("/register", registerClient)
+            ]
   App <$> nestSnaplet "" oAuth (initInMemoryOAuth doLogin showCode)
 
 
