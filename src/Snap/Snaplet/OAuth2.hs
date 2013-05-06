@@ -60,7 +60,7 @@ import qualified Snap.Snaplet.OAuth2.AuthorizationGrant as AuthorizationGrant
 -- SHOULD be implemented (as defined by RFC-2119).
 class OAuthBackend oauth where
     -- | Store an access token that has been granted to a client.
-    storeToken :: oauth scope -> (AccessToken scope) -> IO ()
+    storeToken :: oauth scope -> AccessToken scope -> IO ()
 
     -- | Store an authorization grant that has been granted to a client.
     storeAuthorizationGrant :: oauth scope -> AuthorizationGrant scope -> IO ()
@@ -101,11 +101,11 @@ data InMemoryOAuth scope = InMemoryOAuth
 instance OAuthBackend InMemoryOAuth where
   storeAuthorizationGrant be grant =
     MVar.modifyMVar_ (oAuthGranted be) $
-      return . (Map.insert (authGrantCode grant) grant)
+      return . Map.insert (authGrantCode grant) grant
 
   inspectAuthorizationGrant be code =
     MVar.modifyMVar (oAuthGranted be) $
-      return . (swap . Map.updateLookupWithKey (const (const Nothing)) code)
+      return . swap . Map.updateLookupWithKey (const (const Nothing)) code
 
   storeToken be token =
     IORef.modifyIORef (oAuthAliveTokens be) (Map.insert (accessToken token) token)
@@ -187,13 +187,13 @@ data Client = Client { clientRedirectUri :: URI.URI
 
 
 --------------------------------------------------------------------------------
-accessTokenToJSON :: MonadIO m => (AccessToken scope) -> m Value
+accessTokenToJSON :: MonadIO m => AccessToken scope -> m Value
 accessTokenToJSON at = do
     now <- liftIO getCurrentTime
     return $ object
         [ "access_token" .= accessToken at
         , "token_type" .= show (accessTokenType at)
-        , "expires_in" .= (floor $ (accessTokenExpiresAt at) `diffUTCTime` now :: Int)
+        , "expires_in" .= (floor $ accessTokenExpiresAt at `diffUTCTime` now :: Int)
         , "refresh_token" .= accessTokenRefreshToken at
         ]
 
@@ -238,11 +238,13 @@ authorizationRequest authSnap genericDisplay =
 
         return client
 
-    processAuthRequest client = Error.eitherT handleError authReqGranted $ do
-        mandateCodeResponseType
-        scope <- parseReqScope
-        verifyWithResourceOwner client scope
-        produceAuthGrant client scope
+    processAuthRequest client =
+        let handleError = redirectError (clientRedirectUri client)
+        in Error.eitherT handleError authReqGranted $ do
+            mandateCodeResponseType
+            scope <- parseReqScope
+            verifyWithResourceOwner client scope
+            produceAuthGrant client scope
 
     findClient = do
         let showClientError e = case e of
@@ -294,9 +296,7 @@ authorizationRequest authSnap genericDisplay =
 
     discardError = Error.fmapLT (const ())
 
-    displayAuthError e = Snap.writeText e
-
-    handleError = Snap.writeText . Text.pack . show
+    displayAuthError = Snap.writeText
 
     authReqGranted authGrant =
         let uri = clientRedirectUri $ authGrantClient authGrant
@@ -307,23 +307,21 @@ authorizationRequest authSnap genericDisplay =
             else augmentedRedirect uri [ ("code", Text.unpack code) ]
 
     verifyWithResourceOwner client scope = do
-      authResult <- lift $ authSnap client (Set.toList $ scope)
+      authResult <- lift $ authSnap client (Set.toList scope)
       case authResult of
-        Granted    -> Error.right $ AuthorizationGrant.AccessDenied
+        Granted    -> Error.right AuthorizationGrant.AccessDenied
         InProgress -> lift $ Snap.getResponse >>= Snap.finishWith
-        Denied     -> Error.left $ AuthorizationGrant.AccessDenied
+        Denied     -> Error.left AuthorizationGrant.AccessDenied
 
-    {-redirectError authReq oAuthError =-}
-        {-let uri = authReqRedirectUri authReq-}
-        {-in augmentedRedirect uri-}
-            {-[ ("error", show $ errorCode oAuthError)-}
-            {-, ("error_description", Text.unpack $ errorBody oAuthError)-}
-            {-]-}
+    redirectError uri oAuthError =
+        augmentedRedirect uri
+            [ ("error", show oAuthError)
+            ]
 
     augmentedRedirect uri params =
       Snap.redirect $ encodeUtf8 $ pack $ show $ uri
           { uriQuery = ("?" ++) $ exportParams $
-                       (fromMaybe [] $ importParams $ uriQuery uri) ++
+                       fromMaybe [] (importParams $ uriQuery uri) ++
                        params }
 
     queryRequire = withQueryParams . requireOne
@@ -494,10 +492,9 @@ protect scope failure h =
 
   where
 
-    wwwAuthenticate = do
-        Snap.modifyResponse $
-          Snap.setResponseCode 401 .
-          Snap.setHeader "WWW-Authenticate" "Bearer"
+    wwwAuthenticate = Snap.modifyResponse $
+        Snap.setResponseCode 401 .
+        Snap.setHeader "WWW-Authenticate" "Bearer"
 
     authorizationRequestHeader = do
         ["Bearer", reqToken] <-
