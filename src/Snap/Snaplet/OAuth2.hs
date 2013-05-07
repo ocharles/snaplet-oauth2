@@ -4,7 +4,7 @@
 module Snap.Snaplet.OAuth2
     ( -- * Snaplet Definition
       OAuth
-    , initInMemoryOAuth
+    , initOAuth
 
       -- * Authorization 'Snap.Handler's
     , AuthorizationResult(..)
@@ -20,11 +20,15 @@ module Snap.Snaplet.OAuth2
 
       -- * Defining Protected Resources
     , protect
+
+      -- * OAuth Backends
+    , initInMemoryOAuth
+    , OAuthBackend(..)
     ) where
 
 
 --------------------------------------------------------------------------------
-import Control.Applicative ((<$>), (<|>))
+import Control.Applicative ((<$>), (<*>), (<|>))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.State.Class (get, gets)
 import Control.Monad.Trans (lift)
@@ -55,6 +59,8 @@ import qualified Snap.Snaplet.Session.Common as Snap
 import qualified Snap.Snaplet.OAuth2.AccessToken as AccessToken
 import qualified Snap.Snaplet.OAuth2.AuthorizationGrant as AuthorizationGrant
 
+import Snap.Snaplet.OAuth2.Internal
+
 --------------------------------------------------------------------------------
 -- | All storage backends for OAuth must implement the following API. See the
 -- documentation for each method for various invariants that either MUST or
@@ -82,12 +88,7 @@ class OAuthBackend oauth where
     lookupClient :: oauth scope -> Text -> IO (Maybe Client)
 
     -- | Register a client.
-    registerClient :: oauth scope -> Client -> IO ()
-
-
---------------------------------------------------------------------------------
--- | The type of both authorization request tokens and access tokens.
-type Code = Text
+    storeClient :: oauth scope -> Client -> IO ()
 
 
 --------------------------------------------------------------------------------
@@ -117,13 +118,13 @@ instance OAuthBackend InMemoryOAuth where
   lookupClient be id' =
     Map.lookup id' <$> IORef.readIORef (oAuthClients be)
 
-  registerClient be client =
+  storeClient be client =
     IORef.modifyIORef (oAuthClients be) (Map.insert (clientId client) client)
 
 
 --------------------------------------------------------------------------------
 -- | The OAuth snaplet. You should nest this inside your application snaplet
--- using 'nestSnaplet' with the 'initInMemoryOAuth' initializer.
+-- using 'nestSnaplet' with the 'initOAuth' initializer.
 data OAuth scope = forall o. OAuthBackend o => OAuth
   { oAuthBackend :: o scope
   , oAuthRng :: Snap.RNG
@@ -155,22 +156,25 @@ data AuthorizationGrant scope = AuthorizationGrant
 
 
 --------------------------------------------------------------------------------
-data AccessToken scope = AccessToken
-  { accessToken :: Code
-  , accessTokenType :: AccessTokenType
-  , accessTokenExpiresAt :: UTCTime
-  , accessTokenRefreshToken :: Code
-  , accessTokenClient :: Client
-  , accessTokenScope :: Set.Set scope
-  } deriving (Eq, Ord)
-
-
---------------------------------------------------------------------------------
-data AccessTokenType = Example | Bearer
-  deriving (Eq, Ord, Show)
-
-
---------------------------------------------------------------------------------
+-- | Application-specific definition of scope. Your application should provide
+-- an instance of this for a custom data type. For example:
+--
+-- > data AppScope = Read | Write deriving (Eq, Ord, Show)
+-- >
+-- > instance Scope AppScope where
+-- >   parseScope "read" = return Read
+-- >   parseScope "write" = returnWrite
+-- >   parseScope _ = mzero
+--
+-- >   showScope Read = "read"
+-- >   showScope Write = "write"
+--
+-- This type class has the single law that 'parseScope' and 'showScope' should
+-- mutual inverses. That is:
+--
+--   * @'fmap' 'showScope' '.' 'parseScope' = 'Just'@
+--
+--   * @'parseScope' '.' 'showScope' = 'Just'@
 class Ord a => Scope a where
     parseScope :: Text -> Maybe a
 
@@ -178,14 +182,6 @@ class Ord a => Scope a where
 
     defaultScope :: Maybe [a]
     defaultScope = Nothing
-
-
---------------------------------------------------------------------------------
-data Client = Client { clientRedirectUri :: URI.URI
-                     , clientId :: Text
-                     , clientName :: Text
-                     }
-  deriving (Eq, Ord, Show)
 
 
 --------------------------------------------------------------------------------
@@ -204,14 +200,11 @@ accessTokenToJSON at = do
 data ParameterFailure = MoreThanOne | Missing
   deriving (Enum, Eq, Ord, Show)
 
+
 --------------------------------------------------------------------------------
 requireOne :: BS.ByteString -> Snap.Params
            -> Either ParameterFailure BS.ByteString
-requireOne k m = do
-    optionally <- optionalOne k m
-    case optionally of
-        Just v -> Right v
-        Nothing -> Left Missing
+requireOne k m = optionalOne k m >>= Error.note Missing
 
 
 --------------------------------------------------------------------------------
@@ -451,32 +444,37 @@ newCSRFToken = gets oAuthRng >>= liftIO . Snap.mkCSRFToken
 -- | Initialize the OAuth snaplet, providing handlers to do actual
 -- authentication, and a handler to display an authorization request token to
 -- clients who are not web servers (ie, cannot handle redirections).
-initInMemoryOAuth :: Scope scope
-                  =>(Client -> [scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
-                  -- ^ A handler to perform authorization against the server.
-                  -> (Code -> Snap.Handler b (OAuth scope) ())
-                  -- ^ A handler to display an authorization request 'Code' to
-                  -- clients.
-                  -> (AuthorizationGrantError -> Snap.Handler b (OAuth scope) ())
-                  -- ^ A handler to display authorization grant errors that are
-                  -- so severe they cannot be redirect back to the client
-                  -- (e.g., the @client-id@ field could not be parsed, thus
-                  -- there is no client to redirect the error response to).
-                  -> Snap.SnapletInit b (OAuth scope)
-initInMemoryOAuth authSnap genericCodeDisplay authGrantError =
+initOAuth :: (Scope scope, OAuthBackend backend)
+          =>(Client -> [scope] -> Snap.Handler b (OAuth scope) AuthorizationResult)
+          -- ^ A handler to perform authorization against the server.
+          -> (Code -> Snap.Handler b (OAuth scope) ())
+          -- ^ A handler to display an authorization request 'Code' to
+          -- clients.
+          -> (AuthorizationGrantError -> Snap.Handler b (OAuth scope) ())
+          -- ^ A handler to display authorization grant errors that are
+          -- so severe they cannot be redirect back to the client
+          -- (e.g., the @client-id@ field could not be parsed, thus
+          -- there is no client to redirect the error response to).
+          -> backend scope
+          -- ^ The OAuth backend to use for data storage.
+          -> Snap.SnapletInit b (OAuth scope)
+initOAuth authSnap genericCodeDisplay authGrantError backend =
   Snap.makeSnaplet "OAuth" "OAuth 2 Authentication" Nothing $ do
     Snap.addRoutes
       [ ("/auth", authorizationRequest authSnap genericCodeDisplay authGrantError)
       , ("/token", requestToken)
       ]
 
-    codeStore <- liftIO $ MVar.newMVar Map.empty
-    aliveTokens <- liftIO $ IORef.newIORef Map.empty
-    rng <- liftIO Snap.mkRNG
-    clientStore <- liftIO $ IORef.newIORef Map.empty
+    OAuth backend <$> liftIO Snap.mkRNG
 
-    return $ OAuth (InMemoryOAuth codeStore aliveTokens clientStore) rng
 
+--------------------------------------------------------------------------------
+-- | Initialize the in-memory OAuth data store.
+initInMemoryOAuth :: Snap.Initializer b v (InMemoryOAuth scope)
+initInMemoryOAuth = liftIO $
+    InMemoryOAuth <$> MVar.newMVar Map.empty
+                  <*> IORef.newIORef Map.empty
+                  <*> IORef.newIORef Map.empty
 
 --------------------------------------------------------------------------------
 -- | Protect a resource by requiring valid OAuth tokens in the request header
@@ -521,7 +519,7 @@ protect scope h =
 --------------------------------------------------------------------------------
 -- | Register a client.
 register :: Client -> Snap.Handler b (OAuth scope) ()
-register client = nestBackend $ \be -> registerClient be client
+register client = nestBackend $ \be -> storeClient be client
 
 
 --------------------------------------------------------------------------------
