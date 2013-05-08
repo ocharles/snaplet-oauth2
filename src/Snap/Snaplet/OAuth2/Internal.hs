@@ -1,3 +1,6 @@
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE CPP #-}
+
 module Snap.Snaplet.OAuth2.Internal
     ( AccessToken(..)
     , Code
@@ -35,6 +38,13 @@ data AccessTokenType = Example | Bearer
 
 
 --------------------------------------------------------------------------------
+
+#if !MIN_VERSION_network(2,4,0)
+-- Ord instances were introduced in network-2.4.0.0
+deriving instance Ord URI.URIAuth
+deriving instance Ord URI.URI
+#endif
+
 data Client = Client { clientRedirectUri :: URI.URI
                      , clientId :: Text
                      , clientName :: Text
